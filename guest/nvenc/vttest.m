@@ -123,7 +123,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                               (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{} };
 
     NSMutableArray *encoded = [NSMutableArray array];
-    __block size_t bytes = 0; __block int errors = 0;
+    __block size_t bytes = 0; __block int errors = 0, keyframes = 0;
     VTCompressionSessionRef enc = NULL;
     OSStatus st = VTCompressionSessionCreate(NULL, W, H, codec, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)pbAttr, NULL, NULL, NULL, &enc);
     if (st) { printf("RESULT encoder=none create_status=%d\n", (int)st); return 1; }
@@ -163,6 +163,11 @@ int main(int argc, char **argv) { @autoreleasepool {
             ^(OSStatus s, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
                 if (s || !sb) { errors++; return; }
                 bytes += CMSampleBufferGetTotalSampleSize(sb);
+                CFArrayRef at = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+                bool notSync = at && CFArrayGetCount(at) && CFDictionaryContainsKey(CFArrayGetValueAtIndex(at, 0), kCMSampleAttachmentKey_NotSync) &&
+                               CFDictionaryGetValue(CFArrayGetValueAtIndex(at, 0), kCMSampleAttachmentKey_NotSync) == kCFBooleanTrue;
+                if (!notSync) keyframes++;
+                if (getenv("VT_SIZES")) printf("frame size %zu%s\n", CMSampleBufferGetTotalSampleSize(sb), notSync ? "" : " (keyframe)");
                 @synchronized (encoded) { [encoded addObject:(__bridge id)sb]; }
             });
         if (in != pb) CVPixelBufferRelease(in);
@@ -173,8 +178,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     mach_timebase_info_data_t tb; mach_timebase_info(&tb);
     double secs = (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e9;
     VTCompressionSessionInvalidate(enc); CFRelease(enc);
-    printf("encoded: %lu of %d frames, %zu bytes (%.1f Mbit/s at 60 fps), %d errors, %.1f fps\n", (unsigned long)encoded.count, N,
-           bytes, encoded.count ? bytes * 8.0 * 60 / encoded.count / 1e6 : 0, errors, N / secs);
+    printf("encoded: %lu of %d frames (%d keyframes), %zu bytes (%.1f Mbit/s at 60 fps), %d errors, %.1f fps\n", (unsigned long)encoded.count, N,
+           keyframes, bytes, encoded.count ? bytes * 8.0 * 60 / encoded.count / 1e6 : 0, errors, N / secs);
     if (!encoded.count) { printf("RESULT encoder=%s frames=0\n", encId ? [(__bridge NSString *)encId UTF8String] : "?"); return 1; }
 
     // decode with Apple's software decoder, compare luma with the source frame of the same timestamp

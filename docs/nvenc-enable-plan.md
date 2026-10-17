@@ -188,6 +188,27 @@ Applying a new plugin to WindowServer means restarting it: it ignores SIGTERM, s
 or reboot. macOS auto-logs in only once per boot; after that, log in by hand (or `vm/qmp-type.py stdin` with the
 password at the login window).
 
+### Where Parsec's ~12 ms encode goes (4K, 2026-10-17)
+
+`sample` of parsecd during a session: the VideoToolbox compression thread spends ~9 ms of CPU per frame inside the
+library's `EncodeFrame` (Parsec feeds NV12 directly, no pixel conversion in that path):
+
+| part | ms per frame | what |
+|---|---|---|
+| `submit_wait` | ~3.5 | the library spin-waits (`clock_gettime` loop) for NVENC: the GPU encode itself |
+| `nve264_encode` own code | ~2.5 | the library's CPU tiling of the 12 MB frame into GPU memory |
+| our rearrangement (`nvl_band_avx2`) | ~1.65 | cold frames; `swizzle-bench` `COLD=1`: 1.27 ms single-thread AVX2 (old per-chunk: 3.6 ms) |
+| `memmove` + `bzero` in the library | ~1.3 | its own copies and zeroing |
+
+- Splitting our step over threads (GCD 2/4/8 parts, pthreads) gains at most ~0.2 ms: it is memory-bound. Not done.
+- The stream is normal (1 keyframe, then ~70 KB P-frames at 4K for desktop content), so the client's decode time is
+  mostly the 4K resolution.
+- A Windows host does capture and NVENC on the GPU with no CPU passes, hence ~6 ms there.
+- Levers left: (1) resolution: every part above, and the client's decode, scales with pixels (1440p ≈ 0.44×,
+  1080p ≈ 0.25×), but the dummy plug only offers 4K timings and NVKMS refuses scaled modes, so it takes a 1080p/1440p
+  dummy plug or EDID emulator, or fixing the scaled-mode refusal in NVRMFB; (2) the library's own CPU tiling, copies
+  and spin-wait: only nullmoth can move those to the GPU (encode from a GPU surface, as NVENC does on Windows).
+
 ## Step 3: HEVC
 
 #65 found that swapping the tilers in `nve265_open` isn't enough on Ampere. The stream stays undecodable (6 dB,

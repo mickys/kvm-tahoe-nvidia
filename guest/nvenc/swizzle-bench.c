@@ -8,6 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#endif
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 
@@ -130,8 +133,48 @@ static void threaded(BandFn f, int nt, int plane, const uint8_t *src, uint8_t *d
     band_slow(plane, src, d, bpr, rows, full, prow);
 }
 
+
+#ifdef __APPLE__
+// ---- v4: v2 split over GCD's thread pool (threads are reused, unlike v3's pthread_create per frame) ----
+static void gcd(BandFn f, int parts, int plane, const uint8_t *src, uint8_t *d, size_t bpr, size_t rows)
+{
+    size_t full = rows & ~(size_t)7, prow = (rows + 15) & ~(size_t)15, bands = full / 8;
+    dispatch_apply((size_t)parts, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
+        run_bands(f, plane, src, d, bpr, rows, (bands * i / parts) * 8, (bands * (i + 1) / parts) * 8); });
+    band_slow(plane, src, d, bpr, rows, full, prow);
+}
+#endif
+static void cold(void)
+{
+    // 4K NV12, 8 different source frames (8 x 12 MB, more than the L3), as a capture pipeline delivers them
+    const int W = 3840, H = 2160, NF = 8; size_t bpr = W, rows[2] = { H, H / 2 };
+    uint8_t *src[NF][2], *out[2][2];
+    for (int i = 0; i < NF; i++) for (int p = 0; p < 2; p++) { src[i][p] = malloc(bpr * ((rows[p] + 15) & ~15)); for (size_t k = 0; k < bpr * rows[p]; k++) src[i][p][k] = (uint8_t)rand(); }
+    for (int i = 0; i < 2; i++) for (int p = 0; p < 2; p++) out[i][p] = malloc(bpr * ((rows[p] + 15) & ~15));
+    const char *names[] = { "v0 per-chunk", "v2 avx2", "v3 avx2 x4 pthreads", "v4 avx2 gcd x2", "v4 avx2 gcd x4", "v4 avx2 gcd x8" };
+    for (int v = 0; v < 6; v++) {
+        double tot = 0; int n = 0;
+        for (int it = 0; it < 48; it++) {
+            int f = it % NF; uint8_t **o = out[it & 1];
+            double t = now();
+            for (int p = 0; p < 2; p++) {
+                if (v == 0) v0(p, src[f][p], o[p], bpr, rows[p]);
+                else if (v == 1) whole(band_v2, p, src[f][p], o[p], bpr, rows[p]);
+                else if (v == 2) threaded(band_v2, 4, p, src[f][p], o[p], bpr, rows[p]);
+#ifdef __APPLE__
+                else gcd(band_v2, v == 3 ? 2 : v == 4 ? 4 : 8, p, src[f][p], o[p], bpr, rows[p]);
+#else
+                else whole(band_v2, p, src[f][p], o[p], bpr, rows[p]);
+#endif
+            }
+            t = now() - t; if (it >= 8) { tot += t; n++; }
+        }
+        printf("cold 4K frame (luma+chroma), %-20s %.3f ms avg\n", names[v], tot / n * 1e3);
+    }
+}
 int main(void)
 {
+    if (getenv("COLD")) { cold(); return 0; }
     struct { int w, h; } sizes[] = { { 1920, 1080 }, { 3840, 2160 } };
     for (int si = 0; si < 2; si++) {
         int W = sizes[si].w, H = sizes[si].h; size_t bpr = W;   // CVPixelBuffer strides are 64-byte multiples here
