@@ -168,6 +168,9 @@ which also sees the HiDPI modes).
   that point. Suspects: VirtualSMC together with QEMU's isa-applesmc, the ACPI reset path.
 - **Shutdown sometimes hangs in the SMC halt** with the GPU attached. Once `vfs_unmountall(system) end` is in
   serial.log, `vm/run.sh kill` is safe. A plain `sudo shutdown -h now` in the guest usually powers off within seconds.
+- **Occasional boot failure in boot.efi:** `EB.MM.AKMR Err(0xE)` / `STOP 0x15`, "Boot failed - Aborted", then OpenCore
+  waits in its picker (serial.log ends at `OCB: Showing menu...`). The kernel's memory region couldn't be allocated
+  (a random slide collision). `vm/run.sh reset` (or `virsh reset`) boots normally.
 - "Memory Modules Misconfigured" notification (MacPro7,1 expects its DIMM layout); harmless.
 - Copy-engine queue on Ada: the driver logs `copy-engine queue could not be built (VkResult -13)` and uses a graphics
   channel instead (also reported upstream, #93).

@@ -153,6 +153,27 @@ That's what nullmoth already did for the decoder (`libnvdec_h264_t2d.dylib` = un
 - **Cost:** one CPU pass over each frame (12 MB at 4K, 8-byte copies). A Metal/GPU pass would be the next
   optimisation if it shows up in Parsec's encode time.
 
+### Optimisation: the rearrangement a band at a time (2026-10-17)
+
+- The first version computed each 8-byte chunk's source on its own: **2.6 ms per 4K frame** (Ryzen 9 3950X), a large
+  part of Parsec's ~9 ms encode. Patch `0003-plugin-rearrange-pre-Blackwell-NVENC-input-a-band-at.patch` copies whole
+  8-row bands instead: with AVX2, each 64-byte output row is two 32-byte halves built from the two source rows it
+  draws on (luma: every other chunk via `unpacklo/hi_epi64` + `permute4x64`; chroma: two 16-byte pairs), else from a
+  64-entry offset table. Only the partial last band keeps the per-chunk path.
+- `guest/nvenc/swizzle-bench.c` (best of 30, output checked against the per-chunk version):
+
+  | per frame (luma + chroma) | per-chunk (before) | table | **AVX2 (now)** | AVX2 × 4 threads | plain memcpy |
+  |---|---|---|---|---|---|
+  | 1080p, macOS guest | 0.62 ms | 0.16 ms | **0.08 ms** | 0.32 ms | 0.16 ms |
+  | 4K, macOS guest | 2.50 ms | 0.81 ms | **0.51 ms** | 0.64 ms | 0.97 ms |
+
+  It now runs at about the speed of a plain copy, i.e. memory-bound; threads don't help (start-up costs more than
+  the work at 1080p). The plugin's exact code was also checked byte for byte against the per-chunk version on
+  Linux for both planes and odd sizes (1081 rows, 1960-byte stride, 3 rows).
+- Picture unchanged (vttest: 51.6 / 51.5 / 51.4 dB luma at 1080p / 4K / 720p, chroma 42 dB).
+- Testing doesn't need Apple's software decoder at run time: the encoder path never decodes. vttest uses it only as
+  an independent reference (a check with nullmoth's own decoder could hide a shared layout mistake).
+
 ## Step 3: HEVC
 
 #65 found that swapping the tilers in `nve265_open` isn't enough on Ampere. The stream stays undecodable (6 dB,

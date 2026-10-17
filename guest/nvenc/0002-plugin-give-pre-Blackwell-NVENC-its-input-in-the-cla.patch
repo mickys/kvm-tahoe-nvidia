@@ -1,7 +1,7 @@
 From 986b73cfc73b123ccb50a05380a0585b4b97ffb6 Mon Sep 17 00:00:00 2001
 From: mickys <micky@nowlive.ro>
 Date: Sat, 17 Oct 2026 15:39:44 +0300
-Subject: [PATCH 2/2] plugin: give pre-Blackwell NVENC its input in the classic
+Subject: [PATCH 2/3] plugin: give pre-Blackwell NVENC its input in the classic
  layout
 
 libnvenc_h264 tiles NV12 in Blackwell's layout, which Turing, Ampere and
