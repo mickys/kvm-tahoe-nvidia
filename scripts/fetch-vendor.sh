@@ -4,6 +4,7 @@
 #   nvidia-macos-driver      nullmoth's driver source (guest/nvenc builds its Metal plugin from tag v2.3.3)
 #   open-gpu-kernel-modules  NVIDIA RM headers, 610.57.04 = the RM inside driver 2.3.3 (guest/nvidia-smi)
 #   Vulkan-Headers           for building the Metal plugin
+#   open-gpu-doc             NVIDIA's public class docs (NVENC: clc9b7.h, nvenc_drv.h) for guest/nvenc-ng
 set -euo pipefail
 cd "$(dirname "$0")/.."; mkdir -p vendor
 clone() {   # clone <dir> <url> <commit-or-tag> [sparse paths...]
@@ -19,3 +20,4 @@ clone nvidia-macos-driver https://github.com/nullmoth/nvidia-macos-driver.git v2
 clone open-gpu-kernel-modules https://github.com/NVIDIA/open-gpu-kernel-modules.git 610.57.04 \
   src/common/sdk/nvidia/inc src/nvidia/arch/nvalloc/unix/include kernel-open/common/inc
 clone Vulkan-Headers https://github.com/KhronosGroup/Vulkan-Headers.git acbb9391c0a597272800cd3f4363661c00a27c77
+clone open-gpu-doc https://github.com/NVIDIA/open-gpu-doc.git 9fdf5c4062007929d9f4e6cbad9c9771fe61b880
