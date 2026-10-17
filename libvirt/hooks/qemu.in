@@ -1,0 +1,38 @@
+#!/bin/bash
+# libvirt QEMU hook (install as /etc/libvirt/hooks/qemu, mode 755; rendered by libvirt/render.sh). libvirt runs it
+# for every domain as: qemu <domain> <operation> <sub-operation> <extra>. It acts only on @VM_NAME@:
+#   prepare begin  : set the GPU's BAR1 to 2^@GPU_BAR1_LOG2MB@ MB. The guest can't resize it (QEMU exposes only the
+#                    current Resizable BAR size) and macOS + the driver need 4 GB. Needs Linux >= 5.13.
+#   started begin  : expose macOS Screen Sharing on the LAN (tcp-forward.py --vnc-password-only)
+#   release end    : stop the forwarder; put BAR1 back to 2^@GPU_BAR1_RESTORE_LOG2MB@ MB if set (for other users of the GPU)
+# The hook must not call libvirt itself, and stays quick.
+DOM=$1; OP=$2; SUB=$3
+[ "$DOM" = "@VM_NAME@" ] || exit 0
+GPU=@GPU@
+FWD="@REPO@/vm/tcp-forward.py"
+LOG=/var/log/libvirt/qemu/@VM_NAME@-hook.log
+
+bar1() {   # bar1 <log2 MB>: resize BAR1 with no driver bound, then hand the GPU back to vfio-pci
+  local want=$1 G=/sys/bus/pci/devices/$GPU cur drv
+  cur=$(python3 -c "l=open('$G/resource').read().split(chr(10))[1].split(); print((int(l[1],16)-int(l[0],16)+1).bit_length()-21)")
+  [ "$cur" = "$want" ] && return 0
+  drv=$(basename "$(readlink $G/driver 2>/dev/null)" 2>/dev/null)
+  [ -n "$drv" ] && echo "$GPU" > $G/driver/unbind
+  echo "$want" > $G/resource1_resize || { echo "$(date -Is) BAR1 resize to 2^$want MB failed" >> $LOG; return 1; }
+  echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || [ -z "$drv" ] || echo "$GPU" > /sys/bus/pci/drivers/$drv/bind
+  echo "$(date -Is) BAR1 2^$cur MB -> 2^$want MB" >> $LOG
+}
+
+case "$OP/$SUB" in
+  prepare/begin)
+    modprobe vfio-pci 2>/dev/null
+    bar1 @GPU_BAR1_LOG2MB@ || exit 1 ;;
+  started/begin)
+    for a in @LAN_LISTEN@; do L+=" $a:@SCREENSHARING_FWD_PORT@"; done
+    [ -n "${L:-}" ] && setsid nohup python3 "$FWD" --vnc-password-only 127.0.0.1:@SCREENSHARING_FWD_PORT@ $L \
+      >> /var/log/libvirt/qemu/@VM_NAME@-tcp-forward.log 2>&1 < /dev/null & ;;
+  release/end)
+    pkill -f "tcp-forward.py --vnc-password-only 127.0.0.1:@SCREENSHARING_FWD_PORT@" 2>/dev/null
+    [ -n "@GPU_BAR1_RESTORE_LOG2MB@" ] && bar1 @GPU_BAR1_RESTORE_LOG2MB@ ;;
+esac
+exit 0

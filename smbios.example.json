@@ -1,0 +1,8 @@
+{
+  "SystemProductName": "MacPro7,1",
+  "SystemSerialNumber": "GENERATE-ME",
+  "MLB": "GENERATE-ME-MLB",
+  "SystemUUID": "00000000-0000-0000-0000-000000000000",
+  "ROM_and_NIC_MAC": "52:54:00:00:00:00",
+  "note": "Copy to smbios.json (gitignored). Generate a MacPro7,1 serial, MLB and UUID with OpenCore's macserial (or GenSMBIOS); ROM_and_NIC_MAC is used as OpenCore's PlatformInfo ROM and as the VM's NIC MAC. Keep the values stable: they identify the Mac."
+}

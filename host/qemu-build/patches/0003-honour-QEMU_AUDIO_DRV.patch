@@ -1,0 +1,82 @@
+diff --git a/audio/audio.c b/audio/audio.c
+index 6f10ee470ee..12eb66227f8 100644
+--- a/audio/audio.c
++++ b/audio/audio.c
+@@ -83,6 +83,28 @@ void audio_create_default_audiodevs(void)
+     }
+ }
+ 
++/*
++ * kvm-tahoe-nvidia local patch: the default audio backend from QEMU_AUDIO_DRV, as before 8.2. libvirt 7.0
++ * passes -nodefaults (no default audiodevs) and selects the backend only through this variable (e.g. "spice"),
++ * so without this every sound device fails with "no default audio driver available".
++ */
++void audio_create_legacy_env_audiodev(const char *driver)
++{
++    QDict *dict = qdict_new();
++    Audiodev *dev = NULL;
++    Visitor *v;
++
++    qdict_put_str(dict, "driver", driver);
++    qdict_put_str(dict, "id", "#default");
++
++    v = qobject_input_visitor_new_keyval(QOBJECT(dict));
++    qobject_unref(dict);
++    visit_type_Audiodev(v, NULL, &dev, &error_fatal);
++    visit_free(v);
++
++    audio_add_default_audiodev(dev, &error_fatal);
++}
++
+ /*
+  * if we have dev, this function was called because of an -audiodev argument =>
+  *   initialize a new state with it
+diff --git a/include/qemu/audio.h b/include/qemu/audio.h
+index cff8a334f36..9a07dfed9ff 100644
+--- a/include/qemu/audio.h
++++ b/include/qemu/audio.h
+@@ -169,6 +169,7 @@ void audio_add_audiodev(Audiodev *audio);
+ void audio_add_default_audiodev(Audiodev *dev, Error **errp);
+ void audio_parse_option(const char *opt);
+ void audio_create_default_audiodevs(void);
++void audio_create_legacy_env_audiodev(const char *driver);
+ void audio_init_audiodevs(void);
+ void audio_help(void);
+ 
+diff --git a/system/vl.c b/system/vl.c
+index 8bcb982afef..aec79d0efdb 100644
+--- a/system/vl.c
++++ b/system/vl.c
+@@ -197,6 +197,7 @@ static const char *qtest_log;
+ 
+ static int has_defaults = 1;
+ static int default_audio = 1;
++static bool audio_option_given; /* -audiodev or -audio seen (QEMU_AUDIO_DRV local patch) */
+ static int default_serial = 1;
+ static int default_parallel = 1;
+ static int default_monitor = 1;
+@@ -2085,6 +2086,8 @@ static void qemu_create_early_backends(void)
+     audio_init_audiodevs();
+     if (default_audio) {
+         audio_create_default_audiodevs();
++    } else if (!audio_option_given && g_getenv("QEMU_AUDIO_DRV")) {
++        audio_create_legacy_env_audiodev(g_getenv("QEMU_AUDIO_DRV"));
+     }
+ }
+ 
+@@ -3071,6 +3074,7 @@ void qemu_init(int argc, char **argv)
+ #endif
+             case QEMU_OPTION_audiodev:
+                 default_audio = 0;
++                audio_option_given = true;
+                 audio_parse_option(optarg);
+                 break;
+             case QEMU_OPTION_audio: {
+@@ -3080,6 +3084,7 @@ void qemu_init(int argc, char **argv)
+                 Visitor *v;
+                 QDict *dict = keyval_parse(optarg, "driver", &help, &error_fatal);
+                 default_audio = 0;
++                audio_option_given = true;
+                 if (help || (qdict_haskey(dict, "driver") &&
+                              is_help_option(qdict_get_str(dict, "driver")))) {
+                     audio_help();

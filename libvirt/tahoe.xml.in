@@ -1,0 +1,119 @@
+<!--
+  macOS 26 Tahoe with a passed-through NVIDIA GPU, AMD host CPU. Rendered by libvirt/render.sh from config.env and
+  smbios.json (the at-sign placeholders); import the result with virsh define (libvirt/README.md).
+  Needs the libvirt hook (libvirt/hooks/qemu.in): it sets BAR1 to 4 GB before start, which libvirt can't do.
+  Written for libvirt 7.0 + QEMU 11.1 (host/qemu-build). What libvirt 7.0 has no XML for is passed through
+  <qemu:commandline> at the bottom; each line says why.
+-->
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name>@VM_NAME@</name>
+  <title>macOS 26 Tahoe + @GPU@ passthrough</title>
+  <memory unit='KiB'>@MEM_KIB@</memory>
+  <currentMemory unit='KiB'>@MEM_KIB@</currentMemory>
+  <vcpu placement='static'>@SMP@</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-q35-11.1'>hvm</type>
+    <loader readonly='yes' type='pflash'>@QEMU_DIR@/share/qemu/edk2-x86_64-code.fd</loader>
+    <nvram>@VM_DIR@/OVMF_VARS.fd</nvram>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <!-- the real -cpu string is in qemu:commandline (phys-bits, vmware-cpuid-freq, kvm-pv-* are not in libvirt 7.0);
+       this element still sets the -smp topology -->
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' cores='@CORES@' threads='@THREADS@'/>
+  </cpu>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>@QEMU_DIR@/bin/qemu-system-x86_64</emulator>
+
+    <!-- OpenCore (EFI system partition + macOS recovery) and the macOS disk, on q35's built-in AHCI -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='@VM_DIR@/@OC@'/>
+      <target dev='sda' bus='sata'/>
+      <boot order='1'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap' detect_zeroes='unmap'/>
+      <source file='@VM_DIR@/@DISK@'/>
+      <target dev='sdb' bus='sata'/>
+    </disk>
+
+    <!-- 64 GB PCI hole for the GPU's BAR1 -->
+    <controller type='pci' index='0' model='pcie-root'>
+      <pcihole64 unit='KiB'>67108864</pcihole64>
+    </controller>
+    <!-- The GPU sits behind its own root port, as on bare metal: the driver moves BAR1 through the parent root port,
+         which the display needs. The ACPI hot-plug setting that would hide the card is turned off in
+         qemu:commandline. -->
+    <controller type='pci' index='1' model='pcie-root-port'>
+      <model name='pcie-root-port'/>
+      <target chassis='1' port='0x10' hotplug='off'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x10' function='0x0'/>
+    </controller>
+    <controller type='usb' index='0' model='qemu-xhci'/>
+    <controller type='sata' index='0'/>
+
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x@GPU_DOMAIN@' bus='0x@GPU_BUS@' slot='0x@GPU_SLOT@' function='0x@GPU_FUNC@'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0' multifunction='on'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x@AUD_DOMAIN@' bus='0x@AUD_BUS@' slot='0x@AUD_SLOT@' function='0x@AUD_FUNC@'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x1'/>
+    </hostdev>
+
+    <input type='keyboard' bus='usb'/>
+    <input type='tablet' bus='usb'/>
+    <!-- macOS kernel log (boot-args serial=3) -->
+    <serial type='file'>
+      <source path='@VM_DIR@/serial.log' append='on'/>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <!-- the GPU drives the display: no emulated graphics -->
+    <video>
+      <model type='none'/>
+    </video>
+    <memballoon model='none'/>
+  </devices>
+  <qemu:commandline>
+    <!-- CPU: host-phys-bits=off,phys-bits=40 (else the guest sees 48 address bits and the driver can't place BAR1);
+         topoext for threads=2 on AMD; -kvm-pv-eoi,-kvm-pv-unhalt (with them macOS panics in IOKit matching on AMD);
+         vmware-cpuid-freq + invtsc for macOS's TSC. A second -cpu replaces libvirt's. -->
+    <qemu:arg value='-cpu'/>
+    <qemu:arg value='host,host-phys-bits=off,phys-bits=40,+topoext,+invtsc,vmware-cpuid-freq=on,kvm=on,-kvm-pv-eoi,-kvm-pv-unhalt'/>
+    <!-- q35's ACPI PCI hot-plug on bridges replaces the root port's native slot handler: presence-detect and
+         link-active stay 0 and macOS treats the slot as empty -->
+    <qemu:arg value='-global'/>
+    <qemu:arg value='ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='pcie-root-port.power_controller_present=off'/>
+    <!-- OVMF's 64-bit MMIO window (MB) must hold BAR1. libvirt reserves opt/ovmf/ names for <sysinfo type='fwcfg'>. -->
+    <qemu:arg value='-fw_cfg'/>
+    <qemu:arg value='name=opt/ovmf/X-PciMmio64Mb,string=65536'/>
+    <!-- Apple SMC and SMBIOS type 2 (board) for macOS -->
+    <qemu:arg value='-device'/>
+    <qemu:arg value='isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc'/>
+    <qemu:arg value='-smbios'/>
+    <qemu:arg value='type=2'/>
+    <!-- Network: QEMU user-mode NAT through the host, with SSH and Screen Sharing forwarded to host 127.0.0.1 (the same
+         as vm/run.sh, so the guest keeps its NIC, MAC and the host's routes). libvirt 7.0 has no port forwarding for
+         type='user'; a bridged <interface> is the alternative (docs/05-remote-access.md). -->
+    <qemu:arg value='-netdev'/>
+    <qemu:arg value='user,id=net0,hostfwd=tcp:127.0.0.1:@SSH_FWD_PORT@-:22,hostfwd=tcp:127.0.0.1:@SCREENSHARING_FWD_PORT@-:5900'/>
+    <qemu:arg value='-device'/>
+    <qemu:arg value='virtio-net-pci,netdev=net0,mac=@MAC@'/>
+  </qemu:commandline>
+</domain>

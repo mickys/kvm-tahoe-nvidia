@@ -1,0 +1,24 @@
+# local configuration and secrets
+config.env
+.env
+smbios.json
+vnc-password
+# VM data and build output
+*.img
+*.img.new
+*.qcow2
+*.fd
+*.iso
+*.dmg
+*.pkg
+opencore/build/
+opencore/downloads/
+host/qemu-build/qemu/
+host/qemu-build/deps/
+host/qemu-build/logs/
+libvirt/out/
+vendor/
+# runtime files when run from VM_DIR inside the repo
+*.log
+*.pid
+*.sock

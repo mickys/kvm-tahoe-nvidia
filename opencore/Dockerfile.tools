@@ -1,0 +1,6 @@
+# Small image with the disk tools the dev VM lacks: GPT + FAT images (fdisk, dosfstools, mtools), qemu-img, python3 for
+# OpenCore's macrecovery.py / config generation.
+FROM debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq dosfstools mtools fdisk qemu-utils python3 uuid-runtime >/dev/null \
+ && rm -rf /var/lib/apt/lists/*

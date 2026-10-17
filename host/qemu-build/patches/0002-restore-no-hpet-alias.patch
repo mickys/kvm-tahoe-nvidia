@@ -1,0 +1,35 @@
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 34970fffc94..67b29cf4741 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -2179,6 +2179,16 @@ DEFHEADING()
+ 
+ DEFHEADING(USB convenience options:)
+ 
++DEF("no-hpet", 0, QEMU_OPTION_no_hpet,
++    "-no-hpet        disable HPET (alias for -machine hpet=off)\n",
++    QEMU_ARCH_I386)
++SRST
++``-no-hpet``
++    Disable the HPET. Alias for ``-machine hpet=off``. Upstream removed this option in 9.0; this build keeps it
++    because libvirt 7.0 still generates it for ``<timer name='hpet' present='no'/>`` (tahoe-and-nvidia-4090 local
++    patch).
++ERST
++
+ DEF("usb", 0, QEMU_OPTION_usb,
+     "-usb            enable on-board USB host controller (if not enabled by default)\n",
+     QEMU_ARCH_ALL)
+diff --git a/system/vl.c b/system/vl.c
+index 061cbdf860b..8bcb982afef 100644
+--- a/system/vl.c
++++ b/system/vl.c
+@@ -3454,6 +3454,9 @@ void qemu_init(int argc, char **argv)
+             case QEMU_OPTION_usb:
+                 qdict_put_str(machine_opts_dict, "usb", "on");
+                 break;
++            case QEMU_OPTION_no_hpet:
++                qdict_put_str(machine_opts_dict, "hpet", "off");
++                break;
+             case QEMU_OPTION_usbdevice:
+                 qdict_put_str(machine_opts_dict, "usb", "on");
+                 add_device_config(DEV_USB, optarg);

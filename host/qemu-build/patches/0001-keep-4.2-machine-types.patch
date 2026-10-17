@@ -1,0 +1,17 @@
+diff --git a/include/hw/core/boards.h b/include/hw/core/boards.h
+index 29c68931d8a..9ab8b235683 100644
+--- a/include/hw/core/boards.h
++++ b/include/hw/core/boards.h
+@@ -685,7 +685,11 @@ struct MachineState {
+  * and ver_machine_deletion_version logic in docs/conf.py and
+  * the text in docs/about/deprecated.rst
+  */
+-#define MACHINE_VER_DELETION_MAJOR 6
++/*
++ * kvm-tahoe-nvidia local patch: 7 instead of 6, so QEMU 11.1 still registers the x.2 machine types of 4.x
++ * (pc-q35-4.2, pc-i440fx-4.2). edi's libvirt domains are all defined as pc-q35-4.2.
++ */
++#define MACHINE_VER_DELETION_MAJOR 7
+ #define MACHINE_VER_DEPRECATION_MAJOR 3
+ 
+ /*
