@@ -23,7 +23,7 @@ through** and driven by [nullmoth's NVIDIA Metal driver](https://github.com/null
 | `opencore/` | Fetch OpenCore, kexts and macOS recovery; generate config.plist; build the OpenCore disk image |
 | `vm/` | `run.sh` (plain QEMU), `tcp-forward.py` (Screen Sharing for VNC viewers), QMP/VNC helpers |
 | `libvirt/` | Domain XML template, libvirt hook, render/install scripts (libvirt/README.md) |
-| `guest/` | Tools for the macOS guest: nvidia-smi, display modes, Metal benchmark, NVENC patches and tests, nvenc-ng (our own encoder, in progress) |
+| `guest/` | Tools for the macOS guest: nvidia-smi, display modes, Metal benchmark, NVENC patches and tests |
 | `scripts/` | `config.sh` (loader), `fetch-vendor.sh` (third-party sources), `deploy-to-host.sh` |
 | `docs/` | How it works and what was measured (below) |
 
@@ -53,7 +53,7 @@ workstation; the GPU bound to vfio-pci; Linux ≥ 5.13 for BAR resizing).
 - [docs/host-kernel-upgrade.md](docs/host-kernel-upgrade.md): host kernel 5.10 → 6.1 (needed for BAR1 resizing)
 - [docs/4090-linux-baseline.md](docs/4090-linux-baseline.md): the same 4090 in a Linux VM on QEMU 11 (baseline)
 - [docs/driver-test-2.3.3.md](docs/driver-test-2.3.3.md): driver bring-up, self-test and benchmark results
-- [docs/nvenc-replacement.md](docs/nvenc-replacement.md): nvenc-ng, our own NVENC encoder from public docs (design, milestones)
+- Our own NVENC encoder from public docs (replacing the driver's closed library) now lives in its own repository, `nvenc`
 - [docs/nvenc-research.md](docs/nvenc-research.md), [docs/nvenc-enable-plan.md](docs/nvenc-enable-plan.md):
   hardware encoding before Blackwell: what blocks it, how the input layout was measured and fixed, Parsec results
 
