@@ -5,7 +5,7 @@
 # Installing is separate (install-plugin.sh), so a build never touches the running driver.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/../../scripts/config.sh"
-NM=$REPO/vendor/nvidia-macos-driver; VKH=$REPO/vendor/Vulkan-Headers; REV=${NULLMOTH_REV:-v2.3.3}
+NM=$REPO/vendor/nvidia-macos-driver; VKH=$REPO/vendor/Vulkan-Headers; REV=${NULLMOTH_REV:-v2.3.1}   # the plugin source release 2.3.3 ships (its changelog: "2.3.3 ships the 2.3.1 driver")
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stock" "$T/patched"
 git -C "$NM" archive "$REV" plugin | tar -x -C "$T/stock"

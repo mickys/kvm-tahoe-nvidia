@@ -137,11 +137,23 @@ int main(int argc, char **argv) { @autoreleasepool {
 
     NSMutableArray *sources = [NSMutableArray array];
     uint64_t t0 = mach_absolute_time();
+    // VT_RING=n: reuse a ring of n pixel buffers (as capture pipelines and pools do); the source kept for PSNR is a copy
+    int ring = getenv("VT_RING") ? atoi(getenv("VT_RING")) : 0;
+    NSMutableArray *ringBufs = [NSMutableArray array];
+    for (int i = 0; i < ring; i++) { CVPixelBufferRef rb = NULL; CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &rb); [ringBufs addObject:(__bridge_transfer id)rb]; }
     for (int f = 0; f < N; f++) {
         CVPixelBufferRef pb = NULL;
-        CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &pb);
-        fill(pb, f);
-        [sources addObject:(__bridge id)pb];
+        if (ring) {
+            pb = (__bridge CVPixelBufferRef)ringBufs[f % ring]; CVPixelBufferRetain(pb);
+            if (f >= ring) VTCompressionSessionCompleteFrames(enc, kCMTimeInvalid);   // the encoder is done with it
+            fill(pb, f);
+            CVPixelBufferRef copy = NULL; CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &copy);
+            fill(copy, f); [sources addObject:(__bridge_transfer id)copy];
+        } else {
+            CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &pb);
+            fill(pb, f);
+            [sources addObject:(__bridge id)pb];
+        }
         CVPixelBufferRef in = pb;
         if (getenv("VT_PRESWIZZLE")) {
             CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &in);
@@ -181,6 +193,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                 if (s || !img) { derr++; return; }
                 double p = psnr_luma((__bridge CVPixelBufferRef)sources[idx], img);
                 sum += p; if (p < minp) minp = p; decoded++;
+                if (getenv("VT_PERFRAME")) printf("frame %3d luma %.2f\n", idx, p);
                 double cp = psnr_chroma((__bridge CVPixelBufferRef)sources[idx], img, 0); csum += cp; if (cp < cmin) cmin = cp;
                 esum += psnr_chroma((__bridge CVPixelBufferRef)sources[idx], img, 8);
                 if (dump && idx == N / 2) { dump_luma(img, dump); }

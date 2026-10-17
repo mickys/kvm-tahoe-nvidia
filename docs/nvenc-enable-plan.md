@@ -174,6 +174,20 @@ That's what nullmoth already did for the decoder (`libnvdec_h264_t2d.dylib` = un
 - Testing doesn't need Apple's software decoder at run time: the encoder path never decodes. vttest uses it only as
   an independent reference (a check with nullmoth's own decoder could hide a shared layout mistake).
 
+### Build the plugin from v2.3.1, not the v2.3.3 tag (2026-10-17)
+
+Release 2.3.3 **ships the 2.3.1 driver** (its changelog: the 2.3.2 display changes made some Macs worse, "blank or
+torn windows … WindowServer crashes on some Tahoe desktops", and were withdrawn from the package). The `v2.3.3` tag's
+source still contains those plugin commits (`79f47d0` screenshots/window captures/lock screen, `cf92c5a` dummy
+texture/sampler). A plugin built from the tag therefore behaves like 2.3.2: once WindowServer loaded it (first boot
+after installing), the desktop glitched, visible over VNC too. A stock build from `v2.3.1` matches the shipped
+binary (same 420 log strings, same exports), so `guest/nvenc/build-plugin.sh` now builds from v2.3.1
+(`NULLMOTH_REV` overrides). The three plugin patches apply to v2.3.1 in order.
+
+Applying a new plugin to WindowServer means restarting it: it ignores SIGTERM, so `kill -9` it (launchd restarts it)
+or reboot. macOS auto-logs in only once per boot; after that, log in by hand (or `vm/qmp-type.py stdin` with the
+password at the login window).
+
 ## Step 3: HEVC
 
 #65 found that swapping the tilers in `nve265_open` isn't enough on Ampere. The stream stays undecodable (6 dB,
