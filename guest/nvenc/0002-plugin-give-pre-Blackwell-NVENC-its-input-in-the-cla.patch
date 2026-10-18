@@ -1,7 +1,7 @@
-From 986b73cfc73b123ccb50a05380a0585b4b97ffb6 Mon Sep 17 00:00:00 2001
+From c9f55d9b2f287f4178fa4290701d2457c950d2ea Mon Sep 17 00:00:00 2001
 From: mickys <micky@nowlive.ro>
 Date: Sat, 17 Oct 2026 15:39:44 +0300
-Subject: [PATCH 2/3] plugin: give pre-Blackwell NVENC its input in the classic
+Subject: [PATCH] plugin: give pre-Blackwell NVENC its input in the classic
  layout
 
 libnvenc_h264 tiles NV12 in Blackwell's layout, which Turing, Ampere and
@@ -18,15 +18,16 @@ VideoToolbox, decoded with Apple's software decoder: luma PSNR 22 dB
 before, 51.4-51.6 dB after at 720p, 1080p and 2160p (chroma 42 dB).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 986b73cfc73b123ccb50a05380a0585b4b97ffb6)
 ---
  plugin/NVMTLDevice.m | 95 ++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 95 insertions(+)
 
 diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
-index 2b6b9bb..518e632 100644
+index 066c4c1..690116d 100644
 --- a/plugin/NVMTLDevice.m
 +++ b/plugin/NVMTLDevice.m
-@@ -260,6 +260,99 @@ static bool nvmtl_nvenc_forced(const char *knob)
+@@ -261,6 +261,99 @@ static bool nvmtl_nvenc_forced(const char *knob)
      }
      return false;
  }
@@ -126,7 +127,7 @@ index 2b6b9bb..518e632 100644
  static void nvmtl_nvenc_register(void)
  {
      static dispatch_once_t once;
-@@ -281,6 +374,8 @@ static void nvmtl_nvenc_register(void)
+@@ -282,6 +375,8 @@ static void nvmtl_nvenc_register(void)
          if (!h) { nvlog("nvenc: dlopen %s FAILED: %s", path, dlerror()); return; }
          void *fac = dlsym(h, "NVEncH264_CreateInstance");
          if (!fac) { nvlog("nvenc: %s has no NVEncH264_CreateInstance", path); return; }

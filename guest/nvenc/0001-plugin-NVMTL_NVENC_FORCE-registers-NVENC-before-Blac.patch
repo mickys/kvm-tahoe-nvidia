@@ -1,8 +1,7 @@
-From 87f154d7065848f5a2666997563da7113a175568 Mon Sep 17 00:00:00 2001
+From 46e8c5eb8ed1f8634495a0045be133d505c7aba9 Mon Sep 17 00:00:00 2001
 From: mickys <micky@nowlive.ro>
 Date: Sat, 17 Oct 2026 15:39:29 +0300
-Subject: [PATCH 1/3] plugin: NVMTL_NVENC_FORCE registers NVENC before
- Blackwell
+Subject: [PATCH] plugin: NVMTL_NVENC_FORCE registers NVENC before Blackwell
 
 The encoders are registered only when the GPU profile's video layout is
 "blackwell", so on Turing, Ampere and Ada VideoToolbox finds no hardware
@@ -11,15 +10,16 @@ in nvrm610.conf register them anyway, for every process ("1") or for a
 comma-separated list of process names. Default behaviour is unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 87f154d7065848f5a2666997563da7113a175568)
 ---
  plugin/NVMTLDevice.m | 22 ++++++++++++++++++++--
  1 file changed, 20 insertions(+), 2 deletions(-)
 
 diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
-index cf161db..2b6b9bb 100644
+index 1aa853e..066c4c1 100644
 --- a/plugin/NVMTLDevice.m
 +++ b/plugin/NVMTLDevice.m
-@@ -244,13 +244,30 @@ static void nvmtl_nvdec_register(void)
+@@ -245,13 +245,30 @@ static void nvmtl_nvdec_register(void)
                st ? "NOT registered" : "REGISTERED", me, (int)st, path);
      });
  }
@@ -51,7 +51,7 @@ index cf161db..2b6b9bb 100644
          if (!strcmp(me, "WindowServer")) return;
          typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
          RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
-@@ -343,7 +360,8 @@ static void nvmtl_nvenc_hevc_register(void)
+@@ -344,7 +361,8 @@ static void nvmtl_nvenc_hevc_register(void)
      dispatch_once(&once, ^{
          const char *me = getprogname();
          if (getenv("NVMTL_NO_NVENC_HEVC")) { nvlog("nvenc: NVMTL_NO_NVENC_HEVC set - not registering HEVC in %s", me); return; }

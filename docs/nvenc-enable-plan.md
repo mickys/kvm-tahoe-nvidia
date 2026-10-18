@@ -265,3 +265,12 @@ included. Run the first encode tests at a time when that's acceptable.
 | Step 2, option 3 (plugin-side swizzle) | 2–4 days | usable H.264 without touching the closed library |
 | Step 2, option 4 (own encoder) | weeks | H.264 (later HEVC) we fully control |
 | Upstream report with our data | 1 h | nullmoth fixes both codecs properly |
+
+### Moved to driver 2.3.6 (2026-10-18)
+
+The guest runs release 2.3.6 (kexts and plugin, installed with its `install.sh`). 2.3.6 ships its own tag's plugin
+again, so `guest/nvenc/build-plugin.sh` builds from `v2.3.6`, and the four plugin patches are regenerated against it
+(they apply in order; the patched tree equals the fork commits on v2.3.6). The 2.3.1 note above applies to 2.3.3 only.
+`install.sh` replaces the bundle and keeps only the marked user section of `nvrm610.conf`, so after an update put
+`libnvencvt.dylib` back (`codesign -f -s -` it, then install the plugin, which re-signs the bundle) and set the
+`NVMTL_NVENC_FORCE` / `NVMTL_NVENC_IMPL` knobs again.

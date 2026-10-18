@@ -2,7 +2,7 @@
 
 Reference setup: AMD Ryzen 9 3950X host (KVM, Debian, kernel 6.1), Gigabyte RTX 4090 WINDFORCE V2 (AD102,
 `10de:2684`, subsystem `1458:4104`) with an HDMI dummy plug as its only output, macOS 26.7.1 Tahoe, nullmoth's
-NVIDIA driver 2.3.3. All values below that are specific to a machine come from `config.env`.
+NVIDIA driver 2.3.6 (first set up with 2.3.3). All values below that are specific to a machine come from `config.env`.
 
 ## The VM's files (in VM_DIR on the host)
 

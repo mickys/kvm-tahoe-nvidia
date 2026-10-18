@@ -3,7 +3,7 @@
 macOS 26 **Tahoe** (x86_64) in a KVM virtual machine on an **AMD Ryzen** host, with an **NVIDIA RTX 4090 passed
 through** and driven by [nullmoth's NVIDIA Metal driver](https://github.com/nullmoth/nvidia-macos-driver).
 
-| | Status (driver 2.3.3, macOS 26.7.1) |
+| | Status (driver 2.3.6, macOS 26.7.1) |
 |---|---|
 | Boot, install | macOS installed with an emulated Intel CPU, then runs on the host's real Ryzen 9 3950X (AMD_Vanilla) |
 | GPU | RTX 4090 (AD102): Metal 3, 24 GB, 4K desktop drawn by the GPU on an HDMI dummy plug |

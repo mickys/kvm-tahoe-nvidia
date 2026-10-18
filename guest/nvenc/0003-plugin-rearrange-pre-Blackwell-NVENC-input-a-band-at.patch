@@ -1,8 +1,7 @@
-From f22af5044e5f9b457b1b5a7e0d65d5a71f57b1c3 Mon Sep 17 00:00:00 2001
+From e6d5ed7fe0214443ba1276bd7caf7b238f1bdaad Mon Sep 17 00:00:00 2001
 From: mickys <micky@nowlive.ro>
 Date: Sat, 17 Oct 2026 16:26:17 +0300
-Subject: [PATCH 3/3] plugin: rearrange pre-Blackwell NVENC input a band at a
- time
+Subject: [PATCH] plugin: rearrange pre-Blackwell NVENC input a band at a time
 
 The classic-layout copy computed every 8-byte chunk's source on its own,
 2.6 ms per 4K frame on a Ryzen 9 3950X. Whole 8-row bands now go through
@@ -13,15 +12,16 @@ of a plain memcpy; output identical to the per-chunk copy for both
 planes, odd heights and strides that are not a multiple of 64.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit f22af5044e5f9b457b1b5a7e0d65d5a71f57b1c3)
 ---
  plugin/NVMTLDevice.m | 47 ++++++++++++++++++++++++++++++++++++++++++--
  1 file changed, 45 insertions(+), 2 deletions(-)
 
 diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
-index 518e632..c2142bf 100644
+index 690116d..a0b3d2e 100644
 --- a/plugin/NVMTLDevice.m
 +++ b/plugin/NVMTLDevice.m
-@@ -274,6 +274,7 @@ static bool nvmtl_nvenc_forced(const char *knob)
+@@ -275,6 +275,7 @@ static bool nvmtl_nvenc_forced(const char *knob)
  #include <mach-o/loader.h>
  #include <mach/mach.h>
  #include <syslog.h>
@@ -29,7 +29,7 @@ index 518e632..c2142bf 100644
  #include <CoreVideo/CVPixelBuffer.h>
  // CoreVideo is not linked into the plugin; VideoToolbox has loaded it by the time an encoder is registered
  static CVReturn (*g_nvl_lock)(CVPixelBufferRef, CVPixelBufferLockFlags);
-@@ -291,6 +292,41 @@ static CVReturn nvl_lock(CVPixelBufferRef pb, CVPixelBufferLockFlags fl)
+@@ -292,6 +293,41 @@ static CVReturn nvl_lock(CVPixelBufferRef pb, CVPixelBufferLockFlags fl)
      t_nvl.pb = pb; t_nvl.valid[0] = t_nvl.valid[1] = false;      // a new lock = possibly new contents
      return g_nvl_lock(pb, fl);
  }
@@ -71,7 +71,7 @@ index 518e632..c2142bf 100644
  static void *nvl_base(CVPixelBufferRef pb, size_t plane)
  {
      uint8_t *src = g_nvl_base(pb, plane);
-@@ -305,8 +341,15 @@ static void *nvl_base(CVPixelBufferRef pb, size_t plane)
+@@ -306,8 +342,15 @@ static void *nvl_base(CVPixelBufferRef pb, size_t plane)
          free(t_nvl.buf[plane]); t_nvl.buf[plane] = malloc(need); t_nvl.cap[plane] = t_nvl.buf[plane] ? need : 0;
          if (!t_nvl.buf[plane]) return src;
      }
