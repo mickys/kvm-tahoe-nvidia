@@ -2,6 +2,10 @@
 # Build nullmoth's NVMTLDriver (Metal plugin) from v2.3.3 + our patches in the Tahoe guest, the way
 # build/build_plugin_release.sh does (minos 15.0, -DNVMTL_RELEASE=1). Run on the dev VM.
 #   guest/nvenc/build-plugin.sh            build stock + patched into guest ~/nvmtl-build/{stock,patched}/NVMTLDriver
+#   PLUGIN_REF=<git ref>                   "patched" = that ref's plugin/ in vendor/nvidia-macos-driver (e.g. a fork branch
+#                                          that already carries our commits), instead of NULLMOTH_REV + the 0*.patch files
+#   RELEASE=0                              build without -DNVMTL_RELEASE=1: nvlog to syslog + $TMPDIR/nvmtl.log, the
+#                                          /tmp/nvmtl-* switches and NVMTL_* environment knobs work (diagnostics only)
 # Installing is separate (install-plugin.sh), so a build never touches the running driver.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/../../scripts/config.sh"
@@ -9,12 +13,17 @@ NM=$REPO/vendor/nvidia-macos-driver; VKH=$REPO/vendor/Vulkan-Headers; REV=${NULL
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stock" "$T/patched"
 git -C "$NM" archive "$REV" plugin | tar -x -C "$T/stock"
-git -C "$NM" archive "$REV" plugin | tar -x -C "$T/patched"
-for p in "$HERE"/0*.patch; do patch -s -d "$T/patched" -p1 < "$p"; echo "applied $(basename "$p")"; done
+if [ -n "${PLUGIN_REF:-}" ]; then
+  git -C "$NM" archive "$PLUGIN_REF" plugin | tar -x -C "$T/patched"; echo "patched = $PLUGIN_REF ($(git -C "$NM" rev-parse --short "$PLUGIN_REF"))"
+else
+  git -C "$NM" archive "$REV" plugin | tar -x -C "$T/patched"
+  for p in "$HERE"/0*.patch; do patch -s -d "$T/patched" -p1 < "$p"; echo "applied $(basename "$p")"; done
+fi
+RELDEF="-DNVMTL_RELEASE=${RELEASE:-1}"
 cp -r "$VKH/include" "$T/vkinclude"
 tar -C "$T" -cf - stock patched vkinclude | ssh "$GUEST_SSH" 'rm -rf ~/nvmtl-build && mkdir -p ~/nvmtl-build && tar -xf - -C ~/nvmtl-build && cd ~/nvmtl-build &&
   for v in stock patched; do
-    (cd $v/plugin && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 -DNVMTL_RELEASE=1 \
+    (cd $v/plugin && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 '"$RELDEF"' \
       -Wno-protocol -Wno-incomplete-implementation -Werror=unguarded-availability-new -I ../../vkinclude -o ../NVMTLDriver NVMTLDevice.m \
       -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation 2>../build.err) \
       || { echo "$v: BUILD FAILED"; grep " error:" $v/build.err | head -20; exit 1; }
