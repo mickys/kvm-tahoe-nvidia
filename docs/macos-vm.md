@@ -94,6 +94,17 @@ needed and would rewrite the generated OpenCore config. Then boot the `--stage g
   except the cursor. Live: `sudo sysctl -w debug.nvaccel_iop_flip=0`.
 - **Boot guard:** the driver counts display-less starts in NVRAM `nullmoth-nv-starts` and turns itself off after 2.
   Before an experimental boot: `sudo nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts`.
+- **Our plugin patches** (`guest/nvenc/`, against the release tag; `build-plugin.sh` builds stock + patched in the guest,
+  `install-plugin.sh patched` installs, `relogin.sh` makes WindowServer load it):
+  - `0001` `NVMTL_NVENCVT=<process list|1>` in `nvrm610.conf`: loads the open-source H.264 encoder `libnvencvt.dylib`
+    (github.com/mickys/nvenc) from the bundle on GPUs before Blackwell.
+  - `0002` surface-in through the GPU: when WindowServer composites a window drawn by the CPU (WebKit views,
+    CoreGraphics apps), the plugin copied the surface's pages into VRAM with the CPU, and the pages were faulted in
+    again every frame. Now the GPU copies them from the imported pages, and WindowServer keeps uploaded surfaces mapped.
+    Safari full-screen animation (3158x1816 window): 15 → 5.3 ms per frame, WindowServer CPU 128 % → 30 % of a core.
+    `NVMTL_SURFIN_UPLOAD=cpu` / `NVMTL_SURFIN_KEEP=0` turn the two parts off.
+  - WebKit's GPU process can't load the plugin at all (its sandbox maps code only from system paths, not
+    `/Library/GPUBundles`), so Safari paints on the CPU; that is the remaining limit there.
 - Results and tests: docs/driver-test-2.3.3.md.
 
 ## 5. The AMD CPU profile

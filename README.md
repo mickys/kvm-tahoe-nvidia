@@ -10,7 +10,8 @@ through** and driven by [nullmoth's NVIDIA Metal driver](https://github.com/null
 | Driver self-test | nullmoth's `metal_selftest.sh`: 16 ran, 0 failed |
 | Throughput | VRAM 948 GB/s (94 % of spec), PCIe 4.0 x8 11–13 GB/s |
 | Remote desktop | macOS Screen Sharing / VNC viewers, Parsec |
-| Hardware video encode | Not in the stock driver before Blackwell. With the patches in `guest/nvenc/`: H.264 on NVENC, 51.5 dB, Parsec ~9 ms per frame |
+| Hardware video encode | Not in the stock driver before Blackwell. With patch 0001 in `guest/nvenc/` and our open-source encoder ([mickys/nvenc](https://github.com/mickys/nvenc)): H.264 on NVENC, ~54 dB, Parsec 4.7–4.9 ms per 4K frame |
+| Desktop | Patch 0002 in `guest/nvenc/` uploads CPU-drawn windows through the GPU: 15 → 5.3 ms of WindowServer time per frame of a large Safari window, WindowServer CPU 128 % → 30 % of a core |
 | Monitoring | `nvidia-smi` for macOS (`guest/nvidia-smi/`): temperature, P-state, VRAM, utilization, processes |
 
 ## Repository layout
