@@ -24,6 +24,9 @@ ap.add_argument("--cores", type=int, default=8, help="cores per package (the cor
 ap.add_argument("--stage", choices=["install", "gpu"], default="install")
 ap.add_argument("--debug", action="store_true")
 ap.add_argument("--amd-patches", type=Path, help="AMD_Vanilla patches.plist (required for --cpu amd)")
+ap.add_argument("--stock-pat", action="store_true", help="with --cpu amd: keep AMD_Vanilla's 'Fix PAT' patches as shipped "
+                "(PAT entry 6 = uncached-minus, so every write-combined mapping in macOS runs uncached). By default the "
+                "patches are changed to keep entry 6 write-combining, as XNU itself sets it")
 ap.add_argument("-o", "--output", type=Path, required=True)
 a = ap.parse_args()
 
@@ -90,6 +93,14 @@ if a.cpu == "amd":
             r = bytearray(p["Replace"])
             r[1] = cores[0]
             p["Replace"] = bytes(r)
+        # AMD_Vanilla: "_mtrr_update_action | Fix PAT" replaces XNU's PA6 := WC with a fixed PAT 0x0007010600070106
+        # (mov eax/edx, 0x00070106; wrmsr). XNU maps write-combined memory through PAT entry 6, so with it every WC
+        # mapping (the GPU's BAR1 included) runs uncached-minus. Write edx = 0x00010106 instead: PA4 WB, PA5 WC,
+        # PA6 WC, PA7 UC (PA0-PA3 unchanged). Measured: 4K CPU copy into VRAM through BAR1 86 ms -> 3-5.5 ms.
+        if not a.stock_pat and "Fix PAT" in p.get("Comment", ""):
+            r = bytes(p["Replace"]); old = bytes.fromhex("ba06010700")
+            if old in r:
+                p["Replace"] = r.replace(old, bytes.fromhex("ba06010100"))
     c["Kernel"]["Patch"] += amd
     c["Kernel"]["Quirks"]["ProvideCurrentCpuInfo"] = True   # AMD_Vanilla requires it
 c["Kernel"]["Quirks"]["PanicNoKextDump"] = True

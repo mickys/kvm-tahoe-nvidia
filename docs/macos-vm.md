@@ -72,8 +72,10 @@ IOMMU group free. What it took on the 4090, each point found the hard way:
    on `pcie.0` the driver loads and Metal works, but there is no display ("parent root port not found").
 2. **BAR1 = 4 GB.** The guest can't resize BAR1 (QEMU exposes only the current Resizable BAR size), so the host sets
    it through sysfs before the start (`GPU_BAR1_LOG2MB=12`; needs Linux ≥ 5.13, docs/host-kernel-upgrade.md).
-   32 GB: macOS drops the card. 8 GB: macOS computes a garbage BAR address and QEMU aborts
-   (`KVM_SET_USER_MEMORY_REGION … Invalid argument`). The driver needs ≥ 4 GB for the display.
+   The driver needs ≥ 4 GB for the display. Early tests failed with 32 GB (macOS dropped the card) and with 8 GB on
+   `pcie.0` (garbage BAR address, QEMU aborted with `KVM_SET_USER_MEMORY_REGION … Invalid argument`). With the root
+   port and the AMD profile's `phys-bits=40`, 8, 16 and 32 GB all boot with a display (32 GB ≥ VRAM switches the
+   driver to its `static-bar1` scanout policy). 4 GB stays the default: it gave the best desktop update rate.
 3. **A 64 GB PCI hole** (`-global q35-pcihost.pci-hole64-size=64G`) and OVMF's 64-bit MMIO window
    (`-fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=65536`).
 4. QEMU's stderr goes to `qemu.log`; `-daemonize` had hidden that abort.
@@ -110,6 +112,15 @@ and macOS sees "AMD Ryzen 9 3950X", 8C/16T, TSC 3.5 GHz. AMD_Vanilla's core-coun
   memory)", and WindowServer crash-loops in `CoreDisplay_CreateDisplayForCGXDisplayDevice`: no desktop, so no Screen
   Sharing or Parsec. `phys-bits=40` alone has no effect. Check with QMP
   `qom-get /machine/unattached/device[0] phys-bits`.
+- **PAT entry 6 must stay write-combining.** AMD_Vanilla's "_mtrr_update_action | Fix PAT" patch writes the fixed PAT
+  `0x0007010600070106`, whose entry 6 is uncached-minus. XNU maps write-combined memory through entry 6, so with the
+  stock patch every write-combined mapping runs uncached: CPU writes into VRAM through BAR1 reach only 0.37-1.4 GB/s,
+  and the driver's display copy path gets that much slower. `make-config.py` therefore changes the patch to write
+  `0x0001010600070106` (entry 6 write-combining, as XNU sets it); `--stock-pat` keeps the shipped value. Measured on
+  the RTX 4090 at 4K: a frame copied into VRAM through BAR1 takes 3-5.5 ms instead of 86 ms, and the desktop under
+  full-screen motion goes from 4.3-4.8 to 12-17 display updates per second. A host MTRR made no difference either
+  way. To check the guest's PAT, trace its writes on the host during boot: enable the `kvm:kvm_msr` trace event
+  with the filter `ecx == 0x277`.
 - About This Mac still says "Intel Xeon W": it names the CPU from the Mac model (MacPro7,1), not from CPUID. Tools
   that ask the CPU (sysctl, fastfetch) show the Ryzen. RestrictEvents (`revcpuname=`) would change the label.
 

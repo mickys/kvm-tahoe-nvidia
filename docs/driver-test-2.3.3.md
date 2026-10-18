@@ -34,7 +34,8 @@
      BAR1 ("parent root port not found"), and the display never arms.
 2. **BAR1 size.** QEMU exposes only the host's current ReBAR size, so the guest can't resize it. The host (Linux 6.1)
    resizes it through sysfs before start.
-   - 32 GB: macOS drops the device.
+   - 32 GB: macOS drops the device. (Later, with the root port and the AMD profile's `phys-bits=40`, 8, 16 and 32 GB
+     all worked; see docs/macos-vm.md.)
    - 8 GB: macOS assigns a garbage address (0x8108700000000000). QEMU/KVM then abort.
    - 4 GB works, and it is the driver's minimum for the display (per 1401 `guide.py`).
 3. **IONDRVSupport** can't be excluded via OpenCore on Tahoe ("not in Boot KC … Unsupported"). NVRMFB's claim blocks
