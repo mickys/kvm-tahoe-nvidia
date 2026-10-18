@@ -5,6 +5,10 @@
 //   ./vttest [hw|sw] [avc1|hvc1] [W H FRAMES] [dump.ppm]
 // hw = RequireHardwareAcceleratedVideoEncoder (fails instead of falling back), sw = Apple's software encoder.
 // VT_ES=file writes the encoded stream as Annex B (parameter sets first).
+// VT_10BIT=1: 10-bit input (x420, detail below 8-bit steps), ProfileLevel HEVC Main10, decoded and compared at 10 bits.
+// VT_L10R=1 (with VT_10BIT): the input is l10r (10-bit RGB, as ScreenCaptureKit delivers); the reference is Apple's
+// conversion of it to x420 (VTPixelTransferSession, BT.709), so the result covers the encoder's colour conversion too.
+// Apple's transfer point-samples chroma (top-left pixel of each 2x2), so an encoder that averages scores ~43 dB chroma.
 // A Metal device is created first: nullmoth's plugin registers its encoders with VideoToolbox when one comes up.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -13,6 +17,30 @@
 #include <mach/mach_time.h>
 
 static int W = 1920, H = 1080, N = 60;
+static bool ten;   // VT_10BIT
+static OSType PF = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+static bool l10r;   // VT_L10R
+static VTPixelTransferSessionRef xfer;
+
+// l10r frame f: the moving pattern in RGB (10 bits per component)
+static void fill_l10r(CVPixelBufferRef pb, int f)
+{
+    CVPixelBufferLockBaseAddress(pb, 0);
+    uint8_t *p = CVPixelBufferGetBaseAddress(pb); size_t st = CVPixelBufferGetBytesPerRow(pb);
+    for (int r = 0; r < H; r++) {
+        uint32_t *row = (uint32_t *)(p + r * st);
+        for (int c = 0; c < W; c++) {
+            int v = ((c + r + f * 8) & 1023) / 2 + ((((c >> 6) ^ (r >> 6)) & 1) ? 300 : 0);
+            if (abs(c - (f * 24) % W) < 16) v = 1000;
+            int R = v, G = (v * 3 / 4 + (int)(200 * sin((c + f) * 0.01)) + 200) & 1023, B = (1023 - v + ((c + 2 * r) >> 7 & 3)) & 1023;
+            if (R > 1023) R = 1023;
+            row[c] = 3u << 30 | (uint32_t)R << 20 | (uint32_t)G << 10 | (uint32_t)B;
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+}
 
 static void fill(CVPixelBufferRef pb, int f)
 {
@@ -24,12 +52,16 @@ static void fill(CVPixelBufferRef pb, int f)
             // moving diagonal gradient + 64 px checkerboard + a sweeping bar: easy to recognize when torn
             int v = ((c + r + f * 8) & 255) / 2 + ((((c >> 6) ^ (r >> 6)) & 1) ? 90 : 0);
             if (abs(c - (f * 24) % W) < 16) v = 235;
-            y[r * ys + c] = (uint8_t)(16 + v * 219 / 255);
+            if (ten) {   // 10-bit: the same picture plus a slow gradient below one 8-bit step
+                int v10 = (16 + v * 219 / 255) * 4 + ((c + 2 * r) >> 7 & 3);
+                ((uint16_t *)(y + r * ys))[c] = (uint16_t)(v10 << 6);
+            } else y[r * ys + c] = (uint8_t)(16 + v * 219 / 255);
         }
     for (int r = 0; r < H / 2; r++)
         for (int c = 0; c < W / 2; c++) {
-            uv[r * uvs + 2 * c] = (uint8_t)(128 + 60 * sin((c + f) * 0.02));
-            uv[r * uvs + 2 * c + 1] = (uint8_t)(128 + 60 * cos((r + f) * 0.02));
+            double cb = 128 + 60 * sin((c + f) * 0.02), cr = 128 + 60 * cos((r + f) * 0.02);
+            if (ten) { ((uint16_t *)(uv + r * uvs))[2 * c] = (uint16_t)((int)(cb * 4) << 6); ((uint16_t *)(uv + r * uvs))[2 * c + 1] = (uint16_t)((int)(cr * 4) << 6); }
+            else { uv[r * uvs + 2 * c] = (uint8_t)cb; uv[r * uvs + 2 * c + 1] = (uint8_t)cr; }
         }
     CVPixelBufferUnlockBaseAddress(pb, 0);
 }
@@ -62,16 +94,19 @@ static void preswizzle(CVPixelBufferRef src, CVPixelBufferRef dst)
     CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly); CVPixelBufferUnlockBaseAddress(dst, 0);
 }
 
+// sample (8-bit, or 10-bit from a 16-bit word) at row r, column c of a plane
+static inline double px(const uint8_t *p, size_t s, int r, int c) { return ten ? ((const uint16_t *)(p + r * s))[c] >> 6 : p[r * s + c]; }
+
 static double psnr_luma(CVPixelBufferRef a, CVPixelBufferRef b)
 {
     CVPixelBufferLockBaseAddress(a, kCVPixelBufferLock_ReadOnly); CVPixelBufferLockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
     const uint8_t *pa = CVPixelBufferGetBaseAddressOfPlane(a, 0), *pb = CVPixelBufferGetBaseAddressOfPlane(b, 0);
     size_t sa = CVPixelBufferGetBytesPerRowOfPlane(a, 0), sb = CVPixelBufferGetBytesPerRowOfPlane(b, 0);
     double se = 0;
-    for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { double d = (double)pa[r * sa + c] - pb[r * sb + c]; se += d * d; }
+    for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) { double d = px(pa, sa, r, c) - px(pb, sb, r, c); se += d * d; }
     CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly); CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
-    double mse = se / ((double)W * H);
-    return mse == 0 ? 99.0 : 10 * log10(255.0 * 255.0 / mse);
+    double mse = se / ((double)W * H), peak = ten ? 1023.0 : 255.0;
+    return mse == 0 ? 99.0 : 10 * log10(peak * peak / mse);
 }
 
 static double psnr_chroma(CVPixelBufferRef a, CVPixelBufferRef b, int lastRows)
@@ -81,9 +116,9 @@ static double psnr_chroma(CVPixelBufferRef a, CVPixelBufferRef b, int lastRows)
     const uint8_t *pa = CVPixelBufferGetBaseAddressOfPlane(a, 1), *pb = CVPixelBufferGetBaseAddressOfPlane(b, 1);
     size_t sa = CVPixelBufferGetBytesPerRowOfPlane(a, 1), sb = CVPixelBufferGetBytesPerRowOfPlane(b, 1);
     int r0 = lastRows > 0 ? H / 2 - lastRows : 0; double se = 0; long n = 0;
-    for (int r = r0; r < H / 2; r++) for (int c = 0; c < W; c++) { double d = (double)pa[r * sa + c] - pb[r * sb + c]; se += d * d; n++; }
+    for (int r = r0; r < H / 2; r++) for (int c = 0; c < W; c++) { double d = px(pa, sa, r, c) - px(pb, sb, r, c); se += d * d; n++; }
     CVPixelBufferUnlockBaseAddress(a, kCVPixelBufferLock_ReadOnly); CVPixelBufferUnlockBaseAddress(b, kCVPixelBufferLock_ReadOnly);
-    double mse = se / n; return mse == 0 ? 99.0 : 10 * log10(255.0 * 255.0 / mse);
+    double mse = se / n, peak = ten ? 1023.0 : 255.0; return mse == 0 ? 99.0 : 10 * log10(peak * peak / mse);
 }
 
 static void dump_luma(CVPixelBufferRef pb, const char *path)
@@ -101,6 +136,15 @@ int main(int argc, char **argv) { @autoreleasepool {
     CMVideoCodecType codec = (argc > 2 && !strcmp(argv[2], "hvc1")) ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
     if (argc > 5) { W = atoi(argv[3]); H = atoi(argv[4]); N = atoi(argv[5]); }
     const char *dump = argc > 6 ? argv[6] : NULL;
+    ten = getenv("VT_10BIT") != NULL;
+    if (ten) PF = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    l10r = ten && getenv("VT_L10R") != NULL;
+    if (l10r) {
+        VTPixelTransferSessionCreate(NULL, &xfer);
+        VTSessionSetProperty(xfer, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+        VTSessionSetProperty(xfer, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+        VTSessionSetProperty(xfer, kVTPixelTransferPropertyKey_DestinationTransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    }
 
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     printf("metal: %s\n", dev ? dev.name.UTF8String : "(none)");
@@ -119,14 +163,17 @@ int main(int argc, char **argv) { @autoreleasepool {
     // VT_LOWLAT=1: ask for low-latency rate control, as streaming hosts (Parsec) do
     if (getenv("VT_LOWLAT")) spec[(__bridge NSString *)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = @YES;
     if (getenv("VT_LOWLAT")) printf("spec: EnableLowLatencyRateControl\n");
-    NSDictionary *pbAttr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+    NSDictionary *pbAttr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(PF),
                               (__bridge NSString *)kCVPixelBufferWidthKey: @(W), (__bridge NSString *)kCVPixelBufferHeightKey: @(H),
                               (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{} };
 
+    NSDictionary *inAttr = l10r ? @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_ARGB2101010LEPacked),
+                                     (__bridge NSString *)kCVPixelBufferWidthKey: @(W), (__bridge NSString *)kCVPixelBufferHeightKey: @(H),
+                                     (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{} } : pbAttr;
     NSMutableArray *encoded = [NSMutableArray array];
     __block size_t bytes = 0; __block int errors = 0, keyframes = 0;
     VTCompressionSessionRef enc = NULL;
-    OSStatus st = VTCompressionSessionCreate(NULL, W, H, codec, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)pbAttr, NULL, NULL, NULL, &enc);
+    OSStatus st = VTCompressionSessionCreate(NULL, W, H, codec, (__bridge CFDictionaryRef)spec, (__bridge CFDictionaryRef)inAttr, NULL, NULL, NULL, &enc);
     if (st) { printf("RESULT encoder=none create_status=%d\n", (int)st); return 1; }
     CFStringRef encId = NULL; VTSessionCopyProperty(enc, kVTCompressionPropertyKey_EncoderID, NULL, &encId);
     CFBooleanRef usingHw = NULL; VTSessionCopyProperty(enc, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &usingHw);
@@ -135,6 +182,10 @@ int main(int argc, char **argv) { @autoreleasepool {
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(20000000));
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(60));
+    if (ten) {
+        OSStatus ps = VTSessionSetProperty(enc, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel);
+        printf("ProfileLevel HEVC_Main10_AutoLevel -> %d\n", (int)ps);
+    }
     if (getenv("VT_REFS")) {   // VT_REFS=n: ask for n reference frames (kVTCompressionPropertyKey_ReferenceBufferCount)
         OSStatus rs = VTSessionSetProperty(enc, kVTCompressionPropertyKey_ReferenceBufferCount, (__bridge CFTypeRef)@(atoi(getenv("VT_REFS"))));
         printf("ReferenceBufferCount %s -> %d\n", getenv("VT_REFS"), (int)rs);
@@ -145,23 +196,30 @@ int main(int argc, char **argv) { @autoreleasepool {
     // VT_RING=n: reuse a ring of n pixel buffers (as capture pipelines and pools do); the source kept for PSNR is a copy
     int ring = getenv("VT_RING") ? atoi(getenv("VT_RING")) : 0;
     NSMutableArray *ringBufs = [NSMutableArray array];
-    for (int i = 0; i < ring; i++) { CVPixelBufferRef rb = NULL; CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &rb); [ringBufs addObject:(__bridge_transfer id)rb]; }
+    for (int i = 0; i < ring; i++) { CVPixelBufferRef rb = NULL; CVPixelBufferCreate(NULL, W, H, PF, (__bridge CFDictionaryRef)pbAttr, &rb); [ringBufs addObject:(__bridge_transfer id)rb]; }
     for (int f = 0; f < N; f++) {
         CVPixelBufferRef pb = NULL;
         if (ring) {
             pb = (__bridge CVPixelBufferRef)ringBufs[f % ring]; CVPixelBufferRetain(pb);
             if (f >= ring) VTCompressionSessionCompleteFrames(enc, kCMTimeInvalid);   // the encoder is done with it
             fill(pb, f);
-            CVPixelBufferRef copy = NULL; CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &copy);
+            CVPixelBufferRef copy = NULL; CVPixelBufferCreate(NULL, W, H, PF, (__bridge CFDictionaryRef)pbAttr, &copy);
             fill(copy, f); [sources addObject:(__bridge_transfer id)copy];
+        } else if (l10r) {
+            CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_ARGB2101010LEPacked, (__bridge CFDictionaryRef)inAttr, &pb);
+            fill_l10r(pb, f);
+            CVPixelBufferRef ref = NULL; CVPixelBufferCreate(NULL, W, H, PF, (__bridge CFDictionaryRef)pbAttr, &ref);
+            OSStatus xs = VTPixelTransferSessionTransferImage(xfer, pb, ref);
+            if (xs && f == 0) printf("pixel transfer -> %d\n", (int)xs);
+            [sources addObject:(__bridge_transfer id)ref];
         } else {
-            CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &pb);
+            CVPixelBufferCreate(NULL, W, H, PF, (__bridge CFDictionaryRef)pbAttr, &pb);
             fill(pb, f);
             [sources addObject:(__bridge id)pb];
         }
         CVPixelBufferRef in = pb;
         if (getenv("VT_PRESWIZZLE")) {
-            CVPixelBufferCreate(NULL, W, H, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, (__bridge CFDictionaryRef)pbAttr, &in);
+            CVPixelBufferCreate(NULL, W, H, PF, (__bridge CFDictionaryRef)pbAttr, &in);
             preswizzle(pb, in);
         }
         st = VTCompressionSessionEncodeFrameWithOutputHandler(enc, in, CMTimeMake(f, 60), CMTimeMake(1, 60), NULL, NULL,
@@ -216,7 +274,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     // decode with Apple's software decoder, compare luma with the source frame of the same timestamp
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription((__bridge CMSampleBufferRef)encoded[0]);
     NSDictionary *dspec = @{ (__bridge NSString *)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @NO };
-    NSDictionary *dattr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) };
+    NSDictionary *dattr = @{ (__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(PF) };
     VTDecompressionSessionRef dec = NULL;
     st = VTDecompressionSessionCreate(NULL, fmt, (__bridge CFDictionaryRef)dspec, (__bridge CFDictionaryRef)dattr, NULL, &dec);
     if (st) { printf("decoder create -> %d\n", (int)st); return 1; }
@@ -232,7 +290,7 @@ int main(int argc, char **argv) { @autoreleasepool {
                 if (getenv("VT_PERFRAME")) printf("frame %3d luma %.2f\n", idx, p);
                 double cp = psnr_chroma((__bridge CVPixelBufferRef)sources[idx], img, 0); csum += cp; if (cp < cmin) cmin = cp;
                 esum += psnr_chroma((__bridge CVPixelBufferRef)sources[idx], img, 8);
-                if (dump && idx == N / 2) { dump_luma(img, dump); }
+                if (dump && !ten && idx == N / 2) { dump_luma(img, dump); }
             });
     }
     VTDecompressionSessionWaitForAsynchronousFrames(dec);
