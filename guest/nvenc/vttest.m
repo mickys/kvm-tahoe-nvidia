@@ -9,6 +9,7 @@
 // VT_L10R=1 (with VT_10BIT): the input is l10r (10-bit RGB, as ScreenCaptureKit delivers); the reference is Apple's
 // conversion of it to x420 (VTPixelTransferSession, BT.709), so the result covers the encoder's colour conversion too.
 // Apple's transfer point-samples chroma (top-left pixel of each 2x2), so an encoder that averages scores ~43 dB chroma.
+// VT_PROFILE=<ProfileLevel string> (e.g. H264_High_AutoLevel) and VT_CABAC=1 (H264EntropyMode CABAC) set those properties.
 // A Metal device is created first: nullmoth's plugin registers its encoders with VideoToolbox when one comes up.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -185,6 +186,14 @@ int main(int argc, char **argv) { @autoreleasepool {
     if (ten) {
         OSStatus ps = VTSessionSetProperty(enc, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main10_AutoLevel);
         printf("ProfileLevel HEVC_Main10_AutoLevel -> %d\n", (int)ps);
+    }
+    if (getenv("VT_PROFILE")) {
+        OSStatus ps = VTSessionSetProperty(enc, kVTCompressionPropertyKey_ProfileLevel, (__bridge CFStringRef)@(getenv("VT_PROFILE")));
+        printf("ProfileLevel %s -> %d\n", getenv("VT_PROFILE"), (int)ps);
+    }
+    if (getenv("VT_CABAC")) {
+        OSStatus es = VTSessionSetProperty(enc, kVTCompressionPropertyKey_H264EntropyMode, kVTH264EntropyMode_CABAC);
+        printf("H264EntropyMode CABAC -> %d\n", (int)es);
     }
     if (getenv("VT_REFS")) {   // VT_REFS=n: ask for n reference frames (kVTCompressionPropertyKey_ReferenceBufferCount)
         OSStatus rs = VTSessionSetProperty(enc, kVTCompressionPropertyKey_ReferenceBufferCount, (__bridge CFTypeRef)@(atoi(getenv("VT_REFS"))));
