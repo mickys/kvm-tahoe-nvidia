@@ -274,3 +274,14 @@ again, so `guest/nvenc/build-plugin.sh` builds from `v2.3.6`, and the four plugi
 `install.sh` replaces the bundle and keeps only the marked user section of `nvrm610.conf`, so after an update put
 `libnvencvt.dylib` back (`codesign -f -s -` it, then install the plugin, which re-signs the bundle) and set the
 `NVMTL_NVENC_FORCE` / `NVMTL_NVENC_IMPL` knobs again.
+
+### nullmoth's encoder out, ours in (2026-10-18)
+
+The pre-Blackwell enablement of nullmoth's closed `libnvenc_h264` (patches 0001-0003: `NVMTL_NVENC_FORCE`, the
+classic-layout input hook and its band copy) and the `NVMTL_NVENC_IMPL` swap (0004) are dropped. One patch is left,
+`0001-plugin-NVMTL_NVENCVT-loads-the-open-source-nvenc-H.2.patch`: with `NVMTL_NVENCVT` in `nvrm610.conf` ("1" = every
+process, or a comma-separated list of process names) the plugin loads `libnvencvt.dylib` (github.com/mickys/nvenc) from
+its bundle on GPUs before Blackwell and lets it register with VideoToolbox. Never in WindowServer, never on Blackwell;
+the package's own encoder paths stay as shipped (Blackwell only). Checked on the RTX 4090 with driver 2.3.6: a listed
+process gets `org.nvenc.videoencoder.avc` (hardware, 60/60 frames decoded, 53.9 dB), an unlisted one gets no hardware
+encoder (-12908). The sections above describe the earlier route and are kept for the record.
