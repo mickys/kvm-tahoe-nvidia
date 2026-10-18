@@ -4,6 +4,7 @@
 //         -framework Metal -framework Foundation -framework IOSurface
 //   ./vttest [hw|sw] [avc1|hvc1] [W H FRAMES] [dump.ppm]
 // hw = RequireHardwareAcceleratedVideoEncoder (fails instead of falling back), sw = Apple's software encoder.
+// VT_ES=file writes the encoded stream as Annex B (parameter sets first).
 // A Metal device is created first: nullmoth's plugin registers its encoders with VideoToolbox when one comes up.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -181,6 +182,32 @@ int main(int argc, char **argv) { @autoreleasepool {
     printf("encoded: %lu of %d frames (%d keyframes), %zu bytes (%.1f Mbit/s at 60 fps), %d errors, %.1f fps\n", (unsigned long)encoded.count, N,
            keyframes, bytes, encoded.count ? bytes * 8.0 * 60 / encoded.count / 1e6 : 0, errors, N / secs);
     if (!encoded.count) { printf("RESULT encoder=%s frames=0\n", encId ? [(__bridge NSString *)encId UTF8String] : "?"); return 1; }
+    // VT_ES=file: write the stream as Annex B (parameter sets from the format description, then every frame)
+    if (getenv("VT_ES")) {
+        FILE *es = fopen(getenv("VT_ES"), "wb"); static const uint8_t sc[4] = { 0, 0, 0, 1 };
+        CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription((__bridge CMSampleBufferRef)encoded[0]);
+        size_t nps = 0; int nal_len = 4;
+        if (codec == kCMVideoCodecType_HEVC) CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, NULL, NULL, &nps, &nal_len);
+        else CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, 0, NULL, NULL, &nps, &nal_len);
+        for (size_t i = 0; es && i < nps; i++) {
+            const uint8_t *ps = NULL; size_t pl = 0;
+            if (codec == kCMVideoCodecType_HEVC) CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, i, &ps, &pl, NULL, NULL);
+            else CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, i, &ps, &pl, NULL, NULL);
+            fwrite(sc, 1, 4, es); fwrite(ps, 1, pl, es);
+        }
+        for (id o in encoded) {
+            CMBlockBufferRef bb = CMSampleBufferGetDataBuffer((__bridge CMSampleBufferRef)o);
+            size_t len = CMBlockBufferGetDataLength(bb); uint8_t *d = malloc(len); CMBlockBufferCopyDataBytes(bb, 0, len, d);
+            for (size_t at = 0; at + nal_len <= len; ) {
+                size_t n = 0; for (int k = 0; k < nal_len; k++) n = n << 8 | d[at + k];
+                at += nal_len; if (at + n > len) break;
+                fwrite(sc, 1, 4, es); fwrite(d + at, 1, n, es); at += n;
+            }
+            free(d);
+        }
+        if (es) fclose(es);
+        printf("stream: %s (%zu parameter sets, Annex B)\n", getenv("VT_ES"), nps);
+    }
 
     // decode with Apple's software decoder, compare luma with the source frame of the same timestamp
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription((__bridge CMSampleBufferRef)encoded[0]);
