@@ -135,6 +135,10 @@ int main(int argc, char **argv) { @autoreleasepool {
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(20000000));
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(60));
+    if (getenv("VT_REFS")) {   // VT_REFS=n: ask for n reference frames (kVTCompressionPropertyKey_ReferenceBufferCount)
+        OSStatus rs = VTSessionSetProperty(enc, kVTCompressionPropertyKey_ReferenceBufferCount, (__bridge CFTypeRef)@(atoi(getenv("VT_REFS"))));
+        printf("ReferenceBufferCount %s -> %d\n", getenv("VT_REFS"), (int)rs);
+    }
 
     NSMutableArray *sources = [NSMutableArray array];
     uint64_t t0 = mach_absolute_time();
