@@ -9,6 +9,7 @@
 // VT_L10R=1 (with VT_10BIT): the input is l10r (10-bit RGB, as ScreenCaptureKit delivers); the reference is Apple's
 // conversion of it to x420 (VTPixelTransferSession, BT.709), so the result covers the encoder's colour conversion too.
 // Apple's transfer point-samples chroma (top-left pixel of each 2x2), so an encoder that averages scores ~43 dB chroma.
+// VT_BFRAMES=1: AllowFrameReordering true (B-frames allowed; frames come back in decode order).
 // VT_PROFILE=<ProfileLevel string> (e.g. H264_High_AutoLevel) and VT_CABAC=1 (H264EntropyMode CABAC) set those properties.
 // A Metal device is created first: nullmoth's plugin registers its encoders with VideoToolbox when one comes up.
 #import <Foundation/Foundation.h>
@@ -180,7 +181,8 @@ int main(int argc, char **argv) { @autoreleasepool {
     CFBooleanRef usingHw = NULL; VTSessionCopyProperty(enc, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, NULL, &usingHw);
     printf("encoder: %s hardware=%s\n", encId ? [(__bridge NSString *)encId UTF8String] : "?", usingHw == kCFBooleanTrue ? "yes" : "no");
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-    VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(enc, kVTCompressionPropertyKey_AllowFrameReordering, getenv("VT_BFRAMES") ? kCFBooleanTrue : kCFBooleanFalse);
+    if (getenv("VT_BFRAMES")) VTSessionSetProperty(enc, kVTCompressionPropertyKey_RealTime, kCFBooleanFalse);
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef)@(20000000));
     VTSessionSetProperty(enc, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef)@(60));
     if (ten) {
