@@ -2,7 +2,7 @@
 
 Reference setup: AMD Ryzen 9 3950X host (KVM, Debian, kernel 6.1), Gigabyte RTX 4090 WINDFORCE V2 (AD102,
 `10de:2684`, subsystem `1458:4104`) with an HDMI dummy plug as its only output, macOS 26.7.1 Tahoe, nullmoth's
-NVIDIA driver 2.3.6 (first set up with 2.3.3). All values below that are specific to a machine come from `config.env`.
+NVIDIA driver 2.3.7 (first set up with 2.3.3). All values below that are specific to a machine come from `config.env`.
 
 ## The VM's files (in VM_DIR on the host)
 
@@ -96,9 +96,14 @@ needed and would rewrite the generated OpenCore config. Then boot the `--stage g
   Before an experimental boot: `sudo nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts`.
 - **Our plugin patches** (`guest/nvenc/`, against the release tag; `build-plugin.sh` builds stock + patched in the guest,
   `install-plugin.sh patched` installs, `relogin.sh` makes WindowServer load it):
-  - `0001` `NVMTL_NVENCVT=<process list|1>` in `nvrm610.conf`: loads the open-source H.264 encoder `libnvencvt.dylib`
-    (github.com/mickys/nvenc) from the bundle on GPUs before Blackwell.
-  - `0002` surface-in through the GPU: when WindowServer composites a window drawn by the CPU (WebKit views,
+  - Hardware encoding needs no patch since driver 2.3.7: the stock plugin loads `libnvencvt.dylib` (the open-source
+    H.264/HEVC encoder, github.com/mickys/nvenc) from its bundle when `NVMTL_NVENCVT=<process list|1>` is in
+    `nvrm610.conf`, provided the library and `Contents/MacOS` are owned by root and not group/world-writable
+    (`sudo install -o root -g wheel -m 755 libnvencvt.dylib /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/`).
+    No re-signing is needed: the plugin still loads with the bundle's seal broken by the extra file. Command-line tools
+    (ffmpeg, avconvert) never create a Metal device, so they need `DYLD_INSERT_LIBRARIES=…/libnvencvt.dylib`. Up to
+    2.3.6 this was our patch `0001`.
+  - `0001` surface-in through the GPU: when WindowServer composites a window drawn by the CPU (WebKit views,
     CoreGraphics apps), the plugin copied the surface's pages into VRAM with the CPU, and the pages were faulted in
     again every frame. Now the GPU copies them from the imported pages, and WindowServer keeps uploaded surfaces mapped.
     Safari full-screen animation (3158x1816 window): 15 → 5.3 ms per frame, WindowServer CPU 128 % → 30 % of a core.
