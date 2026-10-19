@@ -11,7 +11,7 @@ through** and driven by [nullmoth's NVIDIA Metal driver](https://github.com/null
 | Throughput | VRAM 948 GB/s (94 % of spec), PCIe 4.0 x8 11–13 GB/s |
 | Remote desktop | macOS Screen Sharing / VNC viewers, Parsec |
 | Hardware video encode | Not in the stock driver before Blackwell. Our open-source encoder ([mickys/nvenc](https://github.com/mickys/nvenc), H.264 and HEVC incl. Main 10) loads through the stock 2.3.7 plugin's `NVMTL_NVENCVT` hook (no patch needed since 2.3.7): Parsec 4.7–4.9 ms per 4K frame |
-| Desktop | Patch 0001 in `guest/nvenc/` uploads CPU-drawn windows through the GPU: 15 → 5.3 ms of WindowServer time per frame of a large Safari window, WindowServer CPU 128 % → 30 % of a core |
+| Desktop | Patch 0001 in `guest/nvenc/` (48 lines on 2.3.7) uploads CPU-drawn windows from their own pages through the GPU: a full-screen 4K Safari window 21 → 34 compositor updates/s, 19.7 → 7.7 ms per upload; smaller windows unchanged |
 | Monitoring | `nvidia-smi` for macOS (`guest/nvidia-smi/`): temperature, P-state, VRAM, utilization, processes |
 
 ## Repository layout

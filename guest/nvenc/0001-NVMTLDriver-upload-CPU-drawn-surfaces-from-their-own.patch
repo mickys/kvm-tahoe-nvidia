@@ -1,0 +1,115 @@
+From 48682176de6635deca358d26ccb5a209a256df74 Mon Sep 17 00:00:00 2001
+From: mickys <micky@nowlive.ro>
+Date: Mon, 19 Oct 2026 05:03:34 +0300
+Subject: [PATCH] NVMTLDriver: upload CPU-drawn surfaces from their own pages
+
+Surface-in copied an IOSurface into its GPU image with the CPU. WindowServer
+lets go of a client's surface after each frame, so the pages are faulted in
+again for every upload, and for a large window most of the copy is faults:
+a full-screen 4K Safari window took ~20 ms per upload against ~7 ms for a
+3200x1800 one. Import the locked pages as host memory and let the copy
+engine read them; fall back to the CPU copy when they cannot be imported.
+NVMTL_SURFIN_UPLOAD=cpu keeps the CPU copy.
+
+Tested on an RTX 4090, macOS 26.7.1: Safari CSS animation in a full-screen
+4K window, 21 -> 34 compositor updates/s, 19.7 -> 7.7 ms per upload.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLObjects.m | 13 ++++++++++++-
+ plugin/nvmtl_vk.c     | 35 +++++++++++++++++++++++++++++++++++
+ plugin/nvmtl_vk.h     |  1 +
+ 3 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 8f6169e..7bf42ac 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -1212,6 +1212,12 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+         return monitor;
+     }
+ }
++// NVMTL_SURFIN_UPLOAD=cpu: surface-in copies with the CPU (nvmtl_vk_image_write) instead of importing the pages
++static bool nvmtl_surfin_import(void) {
++    static int on = -1;
++    if (on < 0) { const char *u = getenv("NVMTL_SURFIN_UPLOAD"); on = !(u && !strcmp(u, "cpu")); }
++    return on;
++}
+ - (void)nvmtlSurfaceIn {
+     NVMTLTexture *r = _parent ? _parent : self;
+     if (!r->_surf) return;
+@@ -1228,7 +1234,12 @@ static id nvmtl_surface_sync(NVMTLTexture *t) {
+     if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, &seed) != kIOReturnSuccess) { nvlog("G13 surface-in: IOSurfaceLock FAILED"); return; }
+     void *base = IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)r->_plane);
+     size_t row = IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)r->_plane);
+-    int rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
++    int rc = -1;
++    if (base && row && nvmtl_surfin_import()) {
++        const size_t off = (size_t)((uint8_t *)base - (uint8_t *)IOSurfaceGetBaseAddress(r->_surf));
++        rc = nvmtl_vk_image_write_host(r->_q, &r->_i, base, row, IOSurfaceGetAllocSize(r->_surf) - off);
++    }
++    if (rc) rc = (base && row) ? nvmtl_vk_image_write(r->_q, &r->_i, base, row) : -1;
+     if (!rc && r->_i.bpp == 4) { char tag[24]; snprintf(tag, sizeof tag, "in%u-", (unsigned)IOSurfaceGetID(r->_surf)); nvmtl_frame_dump(tag, base, row, r->_i.w, r->_i.h); }
+     IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+     if (rc) { nvlog("G13 surface-in: upload FAILED (%ux%u) — retried at the next use", r->_i.w, r->_i.h); return; }
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index 3234e22..2927a68 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -6169,6 +6169,41 @@ static void nvmtl_copy_from_surface(void *dst, const void *src, size_t n)
+     memcpy(dst, src, n);
+ }
+ 
++// Surface-in from the IOSurface's own pages. nvmtl_vk_image_write reads every byte of the surface with the CPU, and
++// WindowServer lets go of a client's surface after each frame, so for a large window most of that copy is page faults:
++// a full-screen 4K Safari window took ~20 ms per upload against ~7 ms for a 3200x1800 one. Importing the locked pages as
++// host memory (VK_EXT_external_memory_host) lets the copy engine read them, and the CPU never touches them (~8 ms at 4K).
++// The caller holds the surface lock across the call, and the import is released before it returns.
++// Non-zero when the pages cannot be imported (block-compressed format, base or length not a multiple of the import
++// alignment, no host import on this device); the caller then uses nvmtl_vk_image_write.
++int nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes)
++{
++    const size_t bpp = img->bpp ? img->bpp : 4;
++    // bufferRowLength counts texels, so the row pitch has to be a whole number of them
++    if (img->bw > 1 || img->bh > 1 || !row_bytes || row_bytes % bpp || row_bytes < (size_t)img->w * bpp) return -1;
++    if (g_host_align) bytes = (bytes + g_host_align - 1) & ~(g_host_align - 1);
++    if ((size_t)img->h * row_bytes > bytes) return -1;
++    nvk_buffer hb;
++    if (nvmtl_vk_buffer_import_host(base, bytes, &hb)) return -1;
++    nvk_cmdbuf c;
++    if (nvmtl_vk_cmd_begin(q, &c)) { nvmtl_vk_buffer_destroy(&hb); return -1; }
++    VkImageSubresourceRange range = { nvmtl_barrier_aspect(img), 0, 1, 0, 1 };
++    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
++    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
++    VkBufferImageCopy bic = { 0, (uint32_t)(row_bytes / bpp), 0, { nvmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
++    pvkCmdCopyBufferToImage(c.cb, (VkBuffer)hb.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
++    VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
++        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
++    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &toRead);
++    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++    const int rc = nvmtl_vk_submit_wait_at(&c, "surface upload (imported pages)");
++    nvmtl_vk_buffer_destroy(&hb);
++    return rc;
++}
+ int nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
+ {
+     const size_t bpp = img->bpp ? img->bpp : 4;
+diff --git a/plugin/nvmtl_vk.h b/plugin/nvmtl_vk.h
+index 29a80dc..3df4c24 100644
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -213,6 +213,7 @@ extern void (*nvmtl_pre_release_hook)(void *);
+ extern void (*nvmtl_pre_submit_hook)(void);
+ int  nvmtl_vk_image_read(nvk_queue *q, nvk_image *img, void *dst, size_t row_bytes);
+ int  nvmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes);
++int  nvmtl_vk_image_write_host(nvk_queue *q, nvk_image *img, void *base, size_t row_bytes, size_t bytes);
+ int  nvmtl_vk_copy_buffer(nvk_queue *q, nvk_buffer *src, size_t srcOff, nvk_buffer *dst, size_t dstOff, size_t size);
+ int  nvmtl_vk_image_create_mips(uint32_t w, uint32_t h, int bgra, uint32_t mips, nvk_image *out);
+ int  nvmtl_vk_image_create_ex(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, int a8, uint32_t mips, nvk_image *out);
+-- 
+2.47.3
+

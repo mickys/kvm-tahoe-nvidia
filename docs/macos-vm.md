@@ -103,11 +103,11 @@ needed and would rewrite the generated OpenCore config. Then boot the `--stage g
     No re-signing is needed: the plugin still loads with the bundle's seal broken by the extra file. Command-line tools
     (ffmpeg, avconvert) never create a Metal device, so they need `DYLD_INSERT_LIBRARIES=…/libnvencvt.dylib`. Up to
     2.3.6 this was our patch `0001`.
-  - `0001` surface-in through the GPU: when WindowServer composites a window drawn by the CPU (WebKit views,
-    CoreGraphics apps), the plugin copied the surface's pages into VRAM with the CPU, and the pages were faulted in
-    again every frame. Now the GPU copies them from the imported pages, and WindowServer keeps uploaded surfaces mapped.
-    Safari full-screen animation (3158x1816 window): 15 → 5.3 ms per frame, WindowServer CPU 128 % → 30 % of a core.
-    `NVMTL_SURFIN_UPLOAD=cpu` / `NVMTL_SURFIN_KEEP=0` turn the two parts off.
+  - `0001` surface-in from the surface's own pages: when WindowServer composites a window drawn by the CPU (WebKit
+    views, CoreGraphics apps), the plugin copied the surface's pages into VRAM with the CPU, and the pages were faulted
+    in again every frame. Now the locked pages are imported as host memory and the GPU copies them (CPU copy as the
+    fallback). Driver 2.3.7, Safari animation in a full-screen 4K window (3840x2110): 21 → 34 compositor updates/s,
+    19.7 → 7.7 ms per upload; a 3200x1800 window is unchanged. `NVMTL_SURFIN_UPLOAD=cpu` turns it off.
   - WebKit's GPU process can't load the plugin at all (its sandbox maps code only from system paths, not
     `/Library/GPUBundles`), so Safari paints on the CPU; that is the remaining limit there.
 - Results and tests: docs/driver-test-2.3.3.md.
