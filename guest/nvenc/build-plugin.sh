@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build nullmoth's NVMTLDriver (Metal plugin) from v2.3.7 + our patches in the Tahoe guest, the way
+# Build nullmoth's NVMTLDriver (Metal plugin) from v2.4.3 + our patches in the Tahoe guest, the way
 # build/build_plugin_release.sh does (minos 15.0, -DNVMTL_RELEASE=1). Run on the dev VM.
 #   guest/nvenc/build-plugin.sh            build stock + patched into guest ~/nvmtl-build/{stock,patched}/NVMTLDriver
 #   PLUGIN_REF=<git ref>                   "patched" = that ref's plugin/ in vendor/nvidia-macos-driver (e.g. a fork branch
@@ -9,7 +9,7 @@
 # Installing is separate (install-plugin.sh), so a build never touches the running driver.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); . "$HERE/../../scripts/config.sh"
-NM=$REPO/vendor/nvidia-macos-driver; VKH=$REPO/vendor/Vulkan-Headers; REV=${NULLMOTH_REV:-v2.3.7}   # the installed release; our patches are regenerated against it
+NM=$REPO/vendor/nvidia-macos-driver; VKH=$REPO/vendor/Vulkan-Headers; REV=${NULLMOTH_REV:-v2.4.3}   # the installed release; our patches are regenerated against it
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/stock" "$T/patched"
 git -C "$NM" archive "$REV" plugin | tar -x -C "$T/stock"

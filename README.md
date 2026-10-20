@@ -3,15 +3,15 @@
 macOS 26 **Tahoe** (x86_64) in a KVM virtual machine on an **AMD Ryzen** host, with an **NVIDIA RTX 4090 passed
 through** and driven by [nullmoth's NVIDIA Metal driver](https://github.com/nullmoth/nvidia-macos-driver).
 
-| | Status (driver 2.3.7, macOS 26.7.1) |
+| | Status (driver 2.4.3, macOS 26.7.1) |
 |---|---|
 | Boot, install | macOS installed with an emulated Intel CPU, then runs on the host's real Ryzen 9 3950X (AMD_Vanilla) |
 | GPU | RTX 4090 (AD102): Metal 3, 24 GB, 4K desktop drawn by the GPU on an HDMI dummy plug |
 | Driver self-test | nullmoth's `metal_selftest.sh`: 16 ran, 0 failed |
 | Throughput | VRAM 948 GB/s (94 % of spec), PCIe 4.0 x8 11–13 GB/s |
 | Remote desktop | macOS Screen Sharing / VNC viewers, Parsec |
-| Hardware video encode | Not in the stock driver before Blackwell. Our open-source encoder ([mickys/nvenc](https://github.com/mickys/nvenc), H.264 and HEVC incl. Main 10) loads through the stock 2.3.7 plugin's `NVMTL_NVENCVT` hook (no patch needed since 2.3.7): Parsec 4.7–4.9 ms per 4K frame |
-| Desktop | Patch 0001 in `guest/nvenc/` (48 lines on 2.3.7) uploads CPU-drawn windows from their own pages through the GPU: a full-screen 4K Safari window 21 → 34 compositor updates/s, 19.7 → 7.7 ms per upload; smaller windows unchanged |
+| Hardware video encode / decode | The stock driver has no encoder for RTX 40 (it ships them for RTX 20, 30 and 50). Our open-source codecs ([mickys/nvenc](https://github.com/mickys/nvenc) 0.8.0: H.264 / HEVC / AV1 encode, H.264 / HEVC / VP9 / AV1 / MPEG-1/2/4 decode) load through the stock plugin's `NVMTL_NVENCVT` hook (no patch needed since 2.3.7): Parsec 4.7–4.9 ms per 4K frame; packaged as the [mickys overlay](https://github.com/mickys/nvidia-macos-driver/releases) |
+| Desktop | Patch 0001 in `guest/nvenc/` (48 lines; applies to 2.3.7 and 2.4.3, measured on 2.3.7) uploads CPU-drawn windows from their own pages through the GPU: a full-screen 4K Safari window 21 → 34 compositor updates/s, 19.7 → 7.7 ms per upload; smaller windows unchanged |
 | Monitoring | `nvidia-smi` for macOS (`guest/nvidia-smi/`): temperature, P-state, VRAM, utilization, processes |
 
 ## Repository layout
