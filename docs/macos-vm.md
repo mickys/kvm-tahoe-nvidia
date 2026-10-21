@@ -34,8 +34,8 @@ opencore/build-esp.sh build/OpenCore-amd-gpu-debug.img --cpu amd --cores 8 --sta
 `make-config.py` starts from OpenCore 1.0.8's Sample.plist, takes OSX-KVM's Tahoe quirks, adds what the driver needs
 (SecureBootModel=Disabled, csr-active-config 0x0A43, Lilu + AMFIPass) and MacPro7,1 from smbios.json, then
 `ocvalidate` checks it. `--stage gpu` adds the driver's boot-args
-(`nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0
--nvrmnoflip`). Copy the image to VM_DIR; `vm/run.sh` takes a staged `<image>.new` at the next start.
+(`nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0`;
+`--noflip` adds `-nvrmnoflip`, see below). Copy the image to VM_DIR; `vm/run.sh` takes a staged `<image>.new` at the next start.
 
 Lessons from building it:
 - A bare FAT image (no partition table) makes OpenCore list itself as the default boot entry; picking it starts
@@ -90,8 +90,12 @@ Use the release tarball's `install.sh` (check `SHA256SUMS.txt`). It links the ke
 Collection with kmutil and needs the GPU present on PCI, so run it with the GPU attached. The 1401 Mac app isn't
 needed and would rewrite the generated OpenCore config. Then boot the `--stage gpu` image.
 
-- **`-nvrmnoflip` (copy path):** with zero-copy scan-out, every screen capture (Screen Sharing, Parsec) is black
-  except the cursor. Live: `sudo sysctl -w debug.nvaccel_iop_flip=0`.
+- **Zero-copy scan-out (no `-nvrmnoflip`):** on driver 2.3.3 every screen capture read black with zero-copy, so
+  `-nvrmnoflip` (the copy path) was the default here until 2026-10-21. Since the kernel's page-off waits for the GPU
+  (2.3.7+) capture works with zero-copy, and the copy path costs a page-off of the whole 8 MB composite under the
+  accelerator lock for every display frame (~100/s, ~2 ms each): on a GTX 1650 at 1080p/165 Hz, Parsec 55 -> 65 fps and
+  a full-screen GPU app 140 -> 160 fps with zero-copy. `make-config.py --noflip` restores the copy path; live:
+  `sudo sysctl -w debug.nvaccel_iop_flip=0|1`; check with `sysctl debug.nvaccel_iop_flip`.
 - **Boot guard:** the driver counts display-less starts in NVRAM `nullmoth-nv-starts` and turns itself off after 2.
   Before an experimental boot: `sudo nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts`.
 - **Our plugin patches** (`guest/nvenc/`, against the release tag; `build-plugin.sh` builds stock + patched in the guest,

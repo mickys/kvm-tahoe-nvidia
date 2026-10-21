@@ -28,6 +28,7 @@ ap.add_argument("--stock-pat", action="store_true", help="with --cpu amd: keep A
                 "(PAT entry 6 = uncached-minus, so every write-combined mapping in macOS runs uncached). By default the "
                 "patches are changed to keep entry 6 write-combining, as XNU itself sets it")
 ap.add_argument("-o", "--output", type=Path, required=True)
+ap.add_argument("--noflip", action="store_true", help="with --stage gpu: -nvrmnoflip (copy-path scan-out; the default before 2026-10-21)")
 a = ap.parse_args()
 
 c = plistlib.load(open(OC / "Docs/Sample.plist", "rb"))
@@ -126,10 +127,13 @@ if a.debug:
     boot_args += ["-v", "debug=0x100", "serial=3"]
 if a.stage == "gpu":
     boot_args += ["nvfb=1", "nvaccel=1", "nvfbheads=4", "-nvkmsnosmooth", "amfi_get_out_of_my_way=0x1",
-                  "amfi=0x80", "ipc_control_port_options=0",
-                  # copy path instead of zero-copy scan-out: with zero-copy, macOS screen capture (Screen Sharing,
-                  # the only way to see this headless VM's desktop) reads black. Same as sysctl debug.nvaccel_iop_flip=0
-                  "-nvrmnoflip"]
+                  "amfi=0x80", "ipc_control_port_options=0"]
+    # -nvrmnoflip = the copy-path scan-out (same as sysctl debug.nvaccel_iop_flip=0). It used to be the default here because
+    # screen capture read black with zero-copy on driver 2.3.3. Since the kernel's page-off waits for the GPU (2.3.7+)
+    # capture works with zero-copy, and the copy path pages the whole composite off VRAM under the accelerator lock for
+    # every display frame (~100/s, ~2 ms each on a GTX 1650: Parsec 55 -> 65 fps, a full-screen GPU app 140 -> 160 fps
+    # at 165 Hz with zero-copy).
+    if a.noflip: boot_args += ["-nvrmnoflip"]
 nv = c["NVRAM"]["Add"][APPLE]
 nv["boot-args"] = " ".join(boot_args)
 nv["csr-active-config"] = bytes.fromhex("430A0000")   # nullmoth's tested SIP value
