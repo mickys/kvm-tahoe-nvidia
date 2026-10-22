@@ -184,8 +184,14 @@ which also sees the HiDPI modes).
 ## 8. Guest tools
 
 - `guest/nvidia-smi/`: an nvidia-smi for macOS (the nvidia-smi 550 table) that reads the GPU's resource manager
-  through the driver's user client: temperature, P-state, VRAM, utilization, processes with their VRAM. Fan and power
-  are N/A (no such controls in RM 610's table). `build.sh` compiles it in the guest (needs the Command Line Tools).
+  through the driver's user client: temperature, P-state, clocks, PCIe link, VRAM, utilization, processes with their
+  VRAM. Power draw, power limits, fan RPM and the extra temperatures come from the RM's user shared data page (class
+  `0x00de`, public header `cl00de.h`), as NVIDIA's NVML reads them. The fan % and the default / min / max power limits
+  come from two undocumented RM controls whose sizes and layouts were probed on RM 615.78.08: `0x2080852f` (cooler
+  status, 844 bytes; input mask in dword 1; fan 0's level in dword 8 as 16.16, RTX 4090 idle 33 % like NVIDIA's
+  driver) and `0x2080a618` (power-domain table, 20512 bytes; 65-dword records, type 0x30 id 0 = min / default / max mW).
+  If an RM rejects them, those values print N/A. `--list` prints every value as key : value. `build.sh` compiles it in
+  the guest (needs the Command Line Tools).
 - `guest/bench/metal-bench.m`: FP32 FMA, VRAM and PCIe bandwidth, dispatch round trip, each with a result check.
 - `guest/nvenc/`: the NVENC patches, plugin build/install scripts, `vttest.m` (VideoToolbox encode + PSNR) and
   `nvdec-probe.m` (layout measurement).

@@ -3,6 +3,7 @@
 //
 //   nvidia-smi                          the default table (GPU, temperature, P-state, memory, utilization, processes)
 //   nvidia-smi -L                       list GPUs with their UUID
+//   nvidia-smi --list                   every value read, one "key : value" per line
 //   nvidia-smi -q [-d SECTIONS]         the full query (sections: MEMORY,UTILIZATION,ENCODER_STATS,TEMPERATURE,POWER,CLOCK,
 //                                       PERFORMANCE,PCI,PIDS; default all)
 //   nvidia-smi --query-gpu=F,F,... --format=csv[,noheader][,nounits]    selected fields (--help-query-gpu lists them)
@@ -13,17 +14,24 @@
 // RM structs and control numbers: NVIDIA open-gpu-kernel-modules 615.78.08 (the RM of NullMoth 2.5.x).
 // Power draw, power limits, fan RPM and the board / memory temperatures come from the RM's user shared data page (class
 // RM_USER_SHARED_DATA, 0x00de, open header class/cl00de.h): allocated on the subdevice with a polling mask, the RM keeps it
-// refreshed and nvidia-smi maps it read-only, as NVIDIA's NVML does. The fan level in % is not on that page: N/A.
+// refreshed and nvidia-smi maps it read-only, as NVIDIA's NVML does. The fan duty % and the default/min/max power limits are
+// not on that page; they come from NVIDIA's closed legacy thermal/pmgr RM controls (0x2080_852f cooler status, 0x2080_a618
+// power-domain table), probed on RM 615.78.08. They are not in the open SDK headers, so NullMoth's NVRM may not dispatch
+// them; then fan % falls back to an RPM/max estimate and those limits print N/A. Everything degrades, nothing breaks.
 // Build: build.sh next to this file.
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <libproc.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t gRunning = 1;
+static void sig_stop(int s) { (void)s; gRunning = 0; }
 
 #include "nvtypes.h"
 #include "nvos.h"
@@ -84,11 +92,19 @@ static NV_STATUS rm_alloc(NvHandle parent, NvHandle *obj, NvU32 cls, void *param
     *obj = p.hObjectNew;
     return p.status;
 }
+static const char *nv_err_name(NV_STATUS s)
+{
+    switch (s) {
+    case 0x1f: return "INVALID_ARGUMENT"; case 0x56: return "NOT_SUPPORTED"; case 0x57: return "OBJECT_NOT_FOUND";
+    case 0x31: return "INVALID_STATE"; case 0x25: return "INVALID_OBJECT"; case 0x48: return "TIMEOUT";
+    default: return NULL;
+    }
+}
 static NV_STATUS rm_ctrl(NvHandle obj, NvU32 cmd, void *params, NvU32 size)
 {
     NVOS54_PARAMETERS p = { .hClient = hClient, .hObject = obj, .cmd = cmd, .params = params, .paramsSize = size };
     if (esc(gCtl, NV_ESC_RM_CONTROL, &p, sizeof p)) return NV_ERR_GENERIC;
-    if (p.status && gVerbose) fprintf(stderr, "control 0x%08x -> status 0x%x\n", cmd, p.status);
+    if (p.status && gVerbose) { const char *n = nv_err_name(p.status); fprintf(stderr, "control 0x%08x -> 0x%x%s%s%s\n", cmd, p.status, n ? " (" : "", n ? n : "", n ? ")" : ""); }
     return p.status;
 }
 // ---- RM user shared data (class 0x00de) -------------------------------------------------------------------------------
@@ -149,16 +165,18 @@ static int rm_open(nv_ioctl_card_info_t *ci)
 #define NA (-1)
 typedef struct { unsigned pid; char type; long long memMiB; } Proc;
 typedef struct {
-    char name[96], uuid[64], vbios[32], busId[32], driver[64], rmVersion[64], arch[32];
-    unsigned devId, subsys;
+    char name[96], uuid[64], vbios[32], busId[32], driver[64], rmVersion[64], arch[32], serial[20], partNumber[24];
+    unsigned devId;
     int temp, tempIoreg, pstate, dispActive;
     long long memTotal, memUsed, memFree, memReserved, bar1Total, bar1Used, busWidth;   // MiB / bits, NA if unknown
     int utilGpu, utilMem, utilEnc, utilDec, utilJpg, utilOfa;                          // %
-    int clkGr, clkMem, clkVid;                                                         // MHz
+    int clkGr, clkMem, clkVid;                                                         // MHz (current)
+    int clkGrMax, clkMemMax, clkVidMax, clkGrDef, clkMemDef;                            // MHz (max / default from GET_LEVEL_INFO)
     int pcieGenCur, pcieGenMax, pcieWidthCur, pcieWidthMax;
     int encSessions, encFps, encLatencyUs;
-    long long powerInst, powerAvg, powerLimitReq, powerLimitEnf;                        // mW, NA if unknown
-    int fanRpm[RUSD_FAN_COOLER_MAX_COOLERS], nFan, tempMem, tempBoard, fanPct;   // fanPct: estimate from fan 0 RPM / gFanMaxRpm
+    long long powerInst, powerAvg, powerLimitReq, powerLimitEnf, powerLimitDef, powerLimitMin, powerLimitMax;   // mW, NA if unknown
+    int fanRpm[RUSD_FAN_COOLER_MAX_COOLERS], nFan, tempMem, tempBoard;   // fanDuty: real % from the cooler-status control; fanPct: estimate from fan 0 RPM / gFanMaxRpm
+    int fanDuty, fanPct;
     Proc procs[256]; int nproc;
 } Gpu;
 
@@ -197,18 +215,54 @@ static int display_active(void)
     return on;
 }
 
+// ---- NVIDIA's closed legacy thermal / pmgr controls (probed on RM 615.78.08, nvsmi-probe.c) ----------------------------
+// Not in the open SDK headers. If NVRM does not dispatch a control it returns an error and we keep whatever the open path
+// already filled in. Sizes are exact (RM checks paramsSize == ctrlParamsSize).
+#define NVSMI_CTRL_COOLER_STATUS      0x2080852fu   // 844 B cooler status; in: dword[1] = cooler mask; out (cooler 0): dword[5] RPM, dword[8] level (16.16, 0x10000 = 100 %)
+#define NVSMI_CTRL_PMGR_POWER_TABLE   0x2080a618u   // 20512 B power-domain table; 65-dword records, type at [+51], id at [+52], {min,def,max} mW at [+53..+55]
+
+// fan 0's level in %, as NVIDIA's fan.speed (RTX 4090 idle: 0x543d = 32.9 % -> 33 %, the same as NVIDIA's Linux driver)
+static int fan_duty(void)
+{
+    static NvU32 b[844 / 4];
+    memset(b, 0, sizeof b);
+    b[1] = 1;   // without a mask the RM answers OK with an empty table
+    NV_STATUS st = rm_ctrl(hSubdev, NVSMI_CTRL_COOLER_STATUS, b, sizeof b);
+    if (st != NV_OK) { if (gVerbose) fprintf(stderr, "nvidia-smi: ctrl 0x%08x (cooler status) -> 0x%x\n", NVSMI_CTRL_COOLER_STATUS, st); return NA; }
+    if (!(b[1] & 1) || b[7] != 0x10000u || b[8] > 0x10000u) { if (gVerbose) fprintf(stderr, "nvidia-smi: cooler status: unexpected layout\n"); return NA; }
+    return (int)(((unsigned long long)b[8] * 100 + 0x8000) >> 16);
+}
+
+static void pmgr_power_limits(Gpu *g)
+{
+    static NvU32 t[20512 / 4];
+    memset(t, 0, sizeof t);
+    NV_STATUS st = rm_ctrl(hSubdev, NVSMI_CTRL_PMGR_POWER_TABLE, t, sizeof t);
+    if (st != NV_OK) { if (gVerbose) fprintf(stderr, "nvidia-smi: ctrl 0x%08x (pmgr power table) -> 0x%x\n", NVSMI_CTRL_PMGR_POWER_TABLE, st); return; }
+    for (unsigned r = 0; r + 65 <= sizeof t / 4; r += 65) {
+        NvU32 type = t[r + 51], id = t[r + 52];
+        if (type != 0x30u || id != 0u) continue;
+        NvU32 mn = t[r + 53], def = t[r + 54], mx = t[r + 55];
+        if (mn < 1000 || mn > 1000000 || def < 1000 || def > 1000000 || mx < 1000 || mx > 1000000 || mn > def || def > mx) continue;
+        g->powerLimitMin = mn; g->powerLimitDef = def; g->powerLimitMax = mx;
+        return;
+    }
+    if (gVerbose) fprintf(stderr, "nvidia-smi: ctrl 0x%08x (pmgr power table): no id-0 power-limit entry\n", NVSMI_CTRL_PMGR_POWER_TABLE);
+}
+
 static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
 {
     memset(g, 0, sizeof *g);
     g->temp = g->tempIoreg = g->pstate = NA;
     g->memTotal = g->memUsed = g->memFree = g->memReserved = g->bar1Total = g->bar1Used = g->busWidth = NA;
     g->utilGpu = g->utilMem = g->utilEnc = g->utilDec = g->utilJpg = g->utilOfa = NA;
-    g->clkGr = g->clkMem = g->clkVid = NA;
+    g->clkGr = g->clkMem = g->clkVid = NA; g->clkGrMax = g->clkMemMax = g->clkVidMax = g->clkGrDef = g->clkMemDef = NA;
     g->pcieGenCur = g->pcieGenMax = g->pcieWidthCur = g->pcieWidthMax = NA;
     g->encSessions = g->encFps = g->encLatencyUs = NA;
-    g->powerInst = g->powerAvg = g->powerLimitReq = g->powerLimitEnf = NA; g->tempMem = g->tempBoard = g->fanPct = NA;
+    g->powerInst = g->powerAvg = g->powerLimitReq = g->powerLimitEnf = NA;
+    g->powerLimitDef = g->powerLimitMin = g->powerLimitMax = NA; g->tempMem = g->tempBoard = g->fanDuty = g->fanPct = NA;
 
-    g->devId = ci->pci_info.device_id; g->subsys = 0;
+    g->devId = ci->pci_info.device_id;
     snprintf(g->arch, sizeof g->arch, "%s", arch_of(g->devId));
     snprintf(g->busId, sizeof g->busId, "%08X:%02X:%02X.%X", ci->pci_info.domain, ci->pci_info.bus, ci->pci_info.slot, ci->pci_info.function);
 
@@ -227,6 +281,12 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
         snprintf(g->vbios, sizeof g->vbios, "%02X.%02X.%02X.%02X.%02X", r >> 24, (r >> 16) & 0xff, (r >> 8) & 0xff, r & 0xff, bi.biosInfoList[1].data & 0xff);
     } else snprintf(g->vbios, sizeof g->vbios, "N/A");
 
+    NV2080_CTRL_GPU_GET_OEM_BOARD_INFO_PARAMS oem; memset(&oem, 0, sizeof oem);
+    if (rm_ctrl(hSubdev, NV2080_CTRL_CMD_GPU_GET_OEM_BOARD_INFO, &oem, sizeof oem) == NV_OK) {
+        snprintf(g->serial, sizeof g->serial, "%.*s", (int)sizeof oem.serialNumber, (char *)oem.serialNumber);
+        snprintf(g->partNumber, sizeof g->partNumber, "%.*s", (int)sizeof oem.productPartNumber, (char *)oem.productPartNumber);
+    }
+
     NV0000_CTRL_SYSTEM_GET_BUILD_VERSION_V2_PARAMS bv; memset(&bv, 0, sizeof bv);
     if (rm_ctrl(hClient, NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION_V2, &bv, sizeof bv) == NV_OK) snprintf(g->rmVersion, sizeof g->rmVersion, "%s", bv.driverVersionBuffer);
     else snprintf(g->rmVersion, sizeof g->rmVersion, "N/A");
@@ -242,7 +302,7 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
     th.instructionList[0].opcode = NV2080_CTRL_THERMAL_SYSTEM_GET_STATUS_SENSOR_READING_OPCODE;
     th.instructionList[0].operands.getStatusSensorReading.sensorIndex = 0;
     if (rm_ctrl(hSubdev, NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2, &th, sizeof th) == NV_OK &&
-        th.successfulInstructions == 1 && th.instructionList[0].executed && th.instructionList[0].result == NV_OK)
+        th.successfulInstructions >= 1 && th.instructionList[0].executed && th.instructionList[0].result == NV_OK)
         g->temp = th.instructionList[0].operands.getStatusSensorReading.value;
     g->tempIoreg = ioreg_temperature();
     if (g->temp == NA) g->temp = g->tempIoreg;
@@ -295,6 +355,20 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
         g->clkGr = s->gpcClkFreqKHz / 1000; g->clkMem = s->dramClkFreqKHz / 1000; g->clkVid = s->nvdClkFreqKHz / 1000;
     }
 
+    // max / default clocks from perf level info (public SDK, pre-GSP — may not answer on all RMs)
+    static NV2080_CTRL_PERF_GET_LEVEL_INFO_V2_PARAMS li; memset(&li, 0, sizeof li);
+    li.level = NV2080_CTRL_PERF_GET_LEVEL_INFO_LEVEL_STANDARD;
+    li.perfGetClkInfoListSize = NV2080_CTRL_PERF_CLK_MAX_DOMAINS;
+    if (rm_ctrl(hSubdev, NV2080_CTRL_CMD_PERF_GET_LEVEL_INFO_V2, &li, sizeof li) == NV_OK) {
+        for (unsigned d = 0; d < li.perfGetClkInfoListSize && d < NV2080_CTRL_PERF_CLK_MAX_DOMAINS; d++) {
+            const NV2080_CTRL_PERF_GET_CLK_INFO *ci = &li.perfGetClkInfoList[d];
+            if (!ci->maxFreq) continue;
+            if (d == 0) { g->clkGrMax = (int)(ci->maxFreq / 1000); g->clkGrDef = ci->defaultFreq ? (int)(ci->defaultFreq / 1000) : NA; }
+            else if (d == 1) { g->clkMemMax = (int)(ci->maxFreq / 1000); g->clkMemDef = ci->defaultFreq ? (int)(ci->defaultFreq / 1000) : NA; }
+            else if (d == 4 || d == 3) { if (g->clkVidMax == NA) g->clkVidMax = (int)(ci->maxFreq / 1000); }
+        }
+    }
+
     // PCIe link: current speed / width and the GPU's maximum
     static NV2080_CTRL_BUS_GET_INFO_V2_PARAMS bus; memset(&bus, 0, sizeof bus); bus.busInfoListSize = 2;
     bus.busInfoList[0].index = NV2080_CTRL_BUS_INFO_INDEX_PCIE_GPU_LINK_CTRL_STATUS;
@@ -330,6 +404,10 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
         if (RUSD_READ_DATA(gRusd, temperatures[RUSD_TEMPERATURE_TYPE_BOARD], &t) && t.temperature > 0) g->tempBoard = NV_TYPES_NV_TEMP_TO_CELSIUS_ROUNDED(t.temperature);
         if (g->powerInst == NA && g->powerAvg != NA) g->powerInst = g->powerAvg;
     }
+
+    // the closed thermal / pmgr controls: the real fan duty cycle and the default/min/max power limits
+    g->fanDuty = fan_duty();
+    pmgr_power_limits(g);
 
     // processes: PIDs that own 3D / compute objects, and their video memory
     const struct { NvU32 cls; char type; } kinds[] = { { 0xC997u, 'G' }, { 0xC9C0u, 'C' }, { 0xC597u, 'G' }, { 0xC5C0u, 'C' }, { 0xC797u, 'G' }, { 0xC7C0u, 'C' } };
@@ -395,9 +473,11 @@ static void print_table(const Gpu *g)
     char pwr[32];
     snprintf(pwr, sizeof pwr, "%s / %s", g->powerInst != NA ? (snprintf(b, sizeof b, "%lldW", (g->powerInst + 500) / 1000), b) : "N/A",
              g->powerLimitEnf != NA ? (snprintf(c, sizeof c, "%lldW", (g->powerLimitEnf + 500) / 1000), c) : "N/A");
-    char fan[8]; if (g->fanPct != NA) snprintf(fan, sizeof fan, "%d%%", g->fanPct); else snprintf(fan, sizeof fan, "N/A");
-    snprintf(a, sizeof a, "%4s  %5s    %-4s", fan, temp, perf); cell(l, 41, a, pwr);
-    if (g->memTotal != NA) snprintf(b, sizeof b, "%lldMiB / %6lldMiB", g->memUsed, g->memTotal);   // like NVIDIA since R535: without "Reserved" else snprintf(b, sizeof b, "N/A / N/A");
+    int fan = g->fanDuty != NA ? g->fanDuty : g->fanPct; char fans[8];
+    if (fan != NA) snprintf(fans, sizeof fans, "%d%%", fan); else snprintf(fans, sizeof fans, "N/A");
+    snprintf(a, sizeof a, "%4s  %5s    %-4s", fans, temp, perf); cell(l, 41, a, pwr);
+    if (g->memTotal != NA) snprintf(b, sizeof b, "%lldMiB / %6lldMiB", g->memUsed, g->memTotal);
+    else snprintf(b, sizeof b, "N/A / N/A");
     cell(m, 24, "", b);
     if (g->utilGpu != NA) snprintf(c, sizeof c, "%8d%%", g->utilGpu); else snprintf(c, sizeof c, "%9s", "N/A");
     cell(r, 22, c, "Default");
@@ -424,7 +504,17 @@ static void print_table(const Gpu *g)
     printf("+-----------------------------------------------------------------------------------------+\n");
 }
 
-static int want(const char *sections, const char *s) { return !sections || strstr(sections, s); }
+static int want(const char *sections, const char *s)
+{
+    if (!sections) return 1;
+    size_t n = strlen(s);
+    for (const char *p = sections; (p = strstr(p, s)); p += n) {
+        int left = (p == sections || p[-1] == ',' || p[-1] == ' ');
+        int right = (p[n] == 0 || p[n] == ',' || p[n] == ' ');
+        if (left && right) return 1;
+    }
+    return 0;
+}
 static void print_q(const Gpu *g, const char *sections)
 {
     char x[64], y[64];
@@ -441,6 +531,8 @@ static void print_q(const Gpu *g, const char *sections)
     printf("    Display Active                        : %s\n", g->dispActive ? "Enabled" : "Disabled");
     printf("    GPU UUID                              : %s\n", g->uuid);
     printf("    VBIOS Version                         : %s\n", g->vbios);
+    if (g->serial[0]) printf("    Serial Number                         : %s\n", g->serial);
+    if (g->partNumber[0]) printf("    Board Part Number                     : %s\n", g->partNumber);
     if (want(sections, "PCI")) {
         printf("    PCI\n");
         printf("        Bus                               : 0x%02X\n", (unsigned)strtoul(g->busId + 9, NULL, 16));
@@ -454,8 +546,9 @@ static void print_q(const Gpu *g, const char *sections)
         printf("                Max                       : %s\n", g->pcieWidthMax != NA ? (snprintf(x, sizeof x, "%dx", g->pcieWidthMax), x) : "N/A");
         printf("                Current                   : %s\n", g->pcieWidthCur != NA ? (snprintf(y, sizeof y, "%dx", g->pcieWidthCur), y) : "N/A");
     }
-    // the level in % is not on the RM's shared data page; shown only as an RPM/max estimate when a max is configured
-    if (g->fanPct != NA) printf("    Fan Speed                             : %d %% (estimated, %d/%d RPM)\n", g->fanPct, g->nFan ? g->fanRpm[0] : 0, gFanMaxRpm);
+    // the real duty cycle from the cooler-status control; without it, an RPM/max estimate when a max is configured
+    if (g->fanDuty != NA) printf("    Fan Speed                             : %d %%\n", g->fanDuty);
+    else if (g->fanPct != NA) printf("    Fan Speed                             : %d %% (estimated, %d/%d RPM)\n", g->fanPct, g->nFan ? g->fanRpm[0] : 0, gFanMaxRpm);
     else printf("    Fan Speed                             : N/A\n");
     for (int i = 0; i < g->nFan; i++) { char lab[48]; snprintf(lab, sizeof lab, "Fan %d Speed (tachometer)", i); printf("    %-38s: %d RPM\n", lab, g->fanRpm[i]); }
     if (want(sections, "PERFORMANCE")) printf("    Performance State                     : %s\n", g->pstate != NA ? (snprintf(x, sizeof x, "P%d", g->pstate), x) : "N/A");
@@ -501,6 +594,9 @@ static void print_q(const Gpu *g, const char *sections)
         printf("        Instantaneous Power Draw          : %s\n", W(g->powerInst));
         printf("        Current Power Limit               : %s\n", W(g->powerLimitEnf));
         printf("        Requested Power Limit             : %s\n", W(g->powerLimitReq));
+        printf("        Default Power Limit               : %s\n", W(g->powerLimitDef));
+        printf("        Min Power Limit                   : %s\n", W(g->powerLimitMin));
+        printf("        Max Power Limit                   : %s\n", W(g->powerLimitMax));
         #undef W
     }
     if (want(sections, "CLOCK")) {
@@ -509,13 +605,22 @@ static void print_q(const Gpu *g, const char *sections)
         printf("        SM                                : %s\n", num(x, sizeof x, g->clkGr, " MHz"));
         printf("        Memory                            : %s\n", num(x, sizeof x, g->clkMem, " MHz"));
         printf("        Video                             : %s\n", num(x, sizeof x, g->clkVid, " MHz"));
+        printf("    Max Clocks\n");
+        printf("        Graphics                          : %s\n", num(x, sizeof x, g->clkGrMax, " MHz"));
+        printf("        SM                                : %s\n", num(x, sizeof x, g->clkGrMax, " MHz"));
+        printf("        Memory                            : %s\n", num(x, sizeof x, g->clkMemMax, " MHz"));
+        printf("        Video                             : %s\n", num(x, sizeof x, g->clkVidMax, " MHz"));
+    }
+    if (want(sections, "ECC")) {
+        printf("    Ecc Mode\n");
+        printf("        Current                           : N/A\n");
+        printf("        Pending                           : N/A\n");
     }
     if (want(sections, "PIDS")) {
         printf("    Processes\n");
         if (!g->nproc) printf("        None\n");
         for (int i = 0; i < g->nproc; i++) {
             char path[PROC_PIDPATHINFO_MAXSIZE]; proc_label(g->procs[i].pid, path, sizeof path);
-            printf("        GPU instance ID                   : N/A\n        Compute instance ID               : N/A\n");
             printf("        Process ID                        : %u\n", g->procs[i].pid);
             printf("            Type                          : %s\n", g->procs[i].type == 'X' ? "C+G" : g->procs[i].type == 'C' ? "C" : "G");
             printf("            Name                          : %s\n", path);
@@ -525,46 +630,116 @@ static void print_q(const Gpu *g, const char *sections)
     printf("\n");
 }
 
-// --query-gpu fields: name, NVIDIA's unit, value (NA = "[N/A]")
-typedef struct { const char *name, *unit; } Field;
+// --query-gpu fields: name, NVIDIA's unit, description
+typedef struct { const char *name, *unit, *desc; } Field;
 static const Field kFields[] = {
-    { "index", "" }, { "name", "" }, { "uuid", "" }, { "pci.bus_id", "" }, { "pci.device_id", "" }, { "driver_version", "" },
-    { "vbios_version", "" }, { "display_active", "" }, { "pstate", "" }, { "temperature.gpu", "" },
-    { "utilization.gpu", " %" }, { "utilization.memory", " %" }, { "utilization.encoder", " %" }, { "utilization.decoder", " %" },
-    { "utilization.jpeg", " %" }, { "utilization.ofa", " %" },
-    { "memory.total", " MiB" }, { "memory.reserved", " MiB" }, { "memory.used", " MiB" }, { "memory.free", " MiB" },
-    { "clocks.gr", " MHz" }, { "clocks.sm", " MHz" }, { "clocks.mem", " MHz" }, { "clocks.video", " MHz" },
-    { "pcie.link.gen.current", "" }, { "pcie.link.gen.max", "" }, { "pcie.link.width.current", "" }, { "pcie.link.width.max", "" },
-    { "encoder.stats.sessionCount", "" }, { "encoder.stats.averageFps", "" }, { "encoder.stats.averageLatency", "" },
-    { "fan.speed", " %" }, { "fan.rpm", " RPM" }, { "power.draw", " W" }, { "power.draw.average", " W" }, { "power.draw.instant", " W" },
-    { "power.limit", " W" }, { "enforced.power.limit", " W" }, { "temperature.memory", "" },
+    { "timestamp", "", "Current timestamp" },
+    { "count", "", "Number of GPUs" },
+    { "index", "", "Zero-based index of the GPU" },
+    { "name", "", "Official product name" },
+    { "uuid", "", "Globally unique immutable identifier" },
+    { "serial", "", "Board serial number (N/A on consumer cards)" },
+    { "gpu_bus_id", "", "PCI bus id (same as pci.bus_id)" },
+    { "pci.bus_id", "", "PCI bus id as domain:bus:device.function" },
+    { "pci.device_id", "", "PCI vendor device id" },
+    { "pci.sub_device_id", "", "PCI sub-system id" },
+    { "driver_version", "", "Installed driver version" },
+    { "vbios_version", "", "VBIOS version of the GPU" },
+    { "display_active", "", "Whether a display is initialized on the GPU" },
+    { "display_mode", "", "Whether a physical display is connected" },
+    { "pstate", "", "Current performance state (P0-P12)" },
+    { "temperature.gpu", "", "Core GPU temperature in degrees C" },
+    { "temperature.memory", "", "HBM memory temperature in degrees C" },
+    { "temperature.board", "", "Board temperature in degrees C" },
+    { "fan.speed", " %", "Fan speed as a percentage of maximum" },
+    { "fan.rpm", " RPM", "Fan speed in RPM (tachometer)" },
+    { "utilization.gpu", " %", "Percent of time the GPU was busy" },
+    { "utilization.memory", " %", "Percent of time the memory controller was busy" },
+    { "utilization.encoder", " %", "Percent of time the encoder was busy" },
+    { "utilization.decoder", " %", "Percent of time the decoder was busy" },
+    { "utilization.jpeg", " %", "Percent of time the JPEG engine was busy" },
+    { "utilization.ofa", " %", "Percent of time the OFA engine was busy" },
+    { "memory.total", " MiB", "Total installed GPU memory" },
+    { "memory.reserved", " MiB", "Memory reserved by the driver" },
+    { "memory.used", " MiB", "Memory allocated by active contexts" },
+    { "memory.free", " MiB", "Unallocated GPU memory" },
+    { "memory.bus_width", " bits", "Memory bus width" },
+    { "bar1.total", " MiB", "Total BAR1 memory" },
+    { "bar1.used", " MiB", "Used BAR1 memory" },
+    { "bar1.free", " MiB", "Free BAR1 memory" },
+    { "clocks.gr", " MHz", "Current frequency of graphics clock" },
+    { "clocks.sm", " MHz", "Current frequency of SM clock" },
+    { "clocks.mem", " MHz", "Current frequency of memory clock" },
+    { "clocks.video", " MHz", "Current frequency of video clock" },
+    { "clocks.current.graphics", " MHz", "Current frequency of graphics clock" },
+    { "clocks.current.sm", " MHz", "Current frequency of SM clock" },
+    { "clocks.current.memory", " MHz", "Current frequency of memory clock" },
+    { "clocks.current.video", " MHz", "Current frequency of video clock" },
+    { "clocks.max.graphics", " MHz", "Maximum frequency of graphics clock" },
+    { "clocks.max.sm", " MHz", "Maximum frequency of SM clock" },
+    { "clocks.max.memory", " MHz", "Maximum frequency of memory clock" },
+    { "clocks.max.video", " MHz", "Maximum frequency of video clock" },
+    { "pcie.link.gen.current", "", "Current PCIe link generation" },
+    { "pcie.link.gen.max", "", "Maximum PCIe link generation" },
+    { "pcie.link.width.current", "", "Current PCIe link width" },
+    { "pcie.link.width.max", "", "Maximum PCIe link width" },
+    { "encoder.stats.sessionCount", "", "Number of active encoder sessions" },
+    { "encoder.stats.averageFps", "", "Average FPS of active encoder sessions" },
+    { "encoder.stats.averageLatency", "", "Average latency of active encoder sessions" },
+    { "power.draw", " W", "Power draw for the entire board" },
+    { "power.draw.average", " W", "Average power draw" },
+    { "power.draw.instant", " W", "Instantaneous power draw" },
+    { "power.limit", " W", "Software power limit" },
+    { "enforced.power.limit", " W", "Enforced power limit" },
+    { "power.default_limit", " W", "Default power limit" },
+    { "power.min_limit", " W", "Minimum power limit" },
+    { "power.max_limit", " W", "Maximum power limit" },
 };
 static int field_value(const Gpu *g, const char *f, char *out, size_t n)
 {
     long long v = NA; const char *s = NULL;
-    if (!strcmp(f, "index")) v = 0; else if (!strcmp(f, "name")) s = g->name; else if (!strcmp(f, "uuid")) s = g->uuid;
-    else if (!strcmp(f, "pci.bus_id")) s = g->busId; else if (!strcmp(f, "driver_version")) s = g->driver;
-    else if (!strcmp(f, "vbios_version")) s = g->vbios; else if (!strcmp(f, "display_active")) s = g->dispActive ? "Enabled" : "Disabled";
+    if (!strcmp(f, "timestamp")) { time_t t = time(NULL); strftime(out, n, "%Y/%m/%d %H:%M:%S.000", localtime(&t)); return 0; }
+    else if (!strcmp(f, "count")) v = 1;
+    else if (!strcmp(f, "index")) v = 0; else if (!strcmp(f, "name")) s = g->name; else if (!strcmp(f, "uuid")) s = g->uuid;
+    else if (!strcmp(f, "serial")) s = g->serial[0] ? g->serial : "[N/A]";
+    else if (!strcmp(f, "gpu_bus_id") || !strcmp(f, "pci.bus_id")) s = g->busId;
+    else if (!strcmp(f, "driver_version")) s = g->driver;
+    else if (!strcmp(f, "vbios_version")) s = g->vbios;
+    else if (!strcmp(f, "display_active")) s = g->dispActive ? "Enabled" : "Disabled";
+    else if (!strcmp(f, "display_mode")) s = g->dispActive ? "Enabled" : "Disabled";
     else if (!strcmp(f, "pci.device_id")) { snprintf(out, n, "0x%04X10DE", g->devId); return 0; }
+    else if (!strcmp(f, "pci.sub_device_id")) s = "[N/A]";
     else if (!strcmp(f, "pstate")) { if (g->pstate == NA) s = "[N/A]"; else { snprintf(out, n, "P%d", g->pstate); return 0; } }
     else if (!strcmp(f, "temperature.gpu")) v = g->temp;
+    else if (!strcmp(f, "temperature.memory")) v = g->tempMem;
+    else if (!strcmp(f, "temperature.board")) v = g->tempBoard;
     else if (!strcmp(f, "utilization.gpu")) v = g->utilGpu; else if (!strcmp(f, "utilization.memory")) v = g->utilMem;
     else if (!strcmp(f, "utilization.encoder")) v = g->utilEnc; else if (!strcmp(f, "utilization.decoder")) v = g->utilDec;
     else if (!strcmp(f, "utilization.jpeg")) v = g->utilJpg; else if (!strcmp(f, "utilization.ofa")) v = g->utilOfa;
     else if (!strcmp(f, "memory.total")) v = g->memTotal; else if (!strcmp(f, "memory.reserved")) v = g->memReserved;
     else if (!strcmp(f, "memory.used")) v = g->memUsed; else if (!strcmp(f, "memory.free")) v = g->memFree;
-    else if (!strcmp(f, "clocks.gr") || !strcmp(f, "clocks.sm")) v = g->clkGr; else if (!strcmp(f, "clocks.mem")) v = g->clkMem;
-    else if (!strcmp(f, "clocks.video")) v = g->clkVid;
+    else if (!strcmp(f, "memory.bus_width")) v = g->busWidth;
+    else if (!strcmp(f, "bar1.total")) v = g->bar1Total;
+    else if (!strcmp(f, "bar1.used")) v = g->bar1Used;
+    else if (!strcmp(f, "bar1.free")) v = (g->bar1Total != NA ? g->bar1Total - g->bar1Used : NA);
+    else if (!strcmp(f, "clocks.gr") || !strcmp(f, "clocks.sm") || !strcmp(f, "clocks.current.graphics") || !strcmp(f, "clocks.current.sm")) v = g->clkGr;
+    else if (!strcmp(f, "clocks.mem") || !strcmp(f, "clocks.current.memory")) v = g->clkMem;
+    else if (!strcmp(f, "clocks.video") || !strcmp(f, "clocks.current.video")) v = g->clkVid;
+    else if (!strcmp(f, "clocks.max.graphics") || !strcmp(f, "clocks.max.sm")) v = g->clkGrMax;
+    else if (!strcmp(f, "clocks.max.memory")) v = g->clkMemMax;
+    else if (!strcmp(f, "clocks.max.video")) v = g->clkVidMax;
     else if (!strcmp(f, "pcie.link.gen.current")) v = g->pcieGenCur; else if (!strcmp(f, "pcie.link.gen.max")) v = g->pcieGenMax;
     else if (!strcmp(f, "pcie.link.width.current")) v = g->pcieWidthCur; else if (!strcmp(f, "pcie.link.width.max")) v = g->pcieWidthMax;
     else if (!strcmp(f, "encoder.stats.sessionCount")) v = g->encSessions; else if (!strcmp(f, "encoder.stats.averageFps")) v = g->encFps;
     else if (!strcmp(f, "encoder.stats.averageLatency")) v = g->encLatencyUs;
-    else if (!strcmp(f, "fan.speed")) v = g->fanPct;
+    else if (!strcmp(f, "fan.speed")) v = g->fanDuty != NA ? g->fanDuty : g->fanPct;
     else if (!strcmp(f, "fan.rpm")) v = g->nFan ? g->fanRpm[0] : NA;
-    else if (!strcmp(f, "temperature.memory")) v = g->tempMem;
-    else if (!strcmp(f, "power.draw") || !strcmp(f, "power.draw.instant") || !strcmp(f, "power.draw.average") || !strcmp(f, "power.limit") || !strcmp(f, "enforced.power.limit")) {
+    else if (!strcmp(f, "power.draw") || !strcmp(f, "power.draw.instant") || !strcmp(f, "power.draw.average") || !strcmp(f, "power.limit") || !strcmp(f, "enforced.power.limit") ||
+             !strcmp(f, "power.default_limit") || !strcmp(f, "power.min_limit") || !strcmp(f, "power.max_limit")) {
         const long long mw = !strcmp(f, "power.draw.average") ? g->powerAvg : !strncmp(f, "power.draw", 10) ? g->powerInst
-                           : !strcmp(f, "power.limit") && g->powerLimitReq != NA ? g->powerLimitReq : g->powerLimitEnf;
+                           : !strcmp(f, "power.limit") && g->powerLimitReq != NA ? g->powerLimitReq
+                           : !strcmp(f, "power.default_limit") ? g->powerLimitDef : !strcmp(f, "power.min_limit") ? g->powerLimitMin
+                           : !strcmp(f, "power.max_limit") ? g->powerLimitMax : g->powerLimitEnf;
         if (mw == NA) s = "[N/A]"; else { snprintf(out, n, "%.2f", mw / 1000.0); return 0; }
     }
     else return -1;
@@ -591,6 +766,38 @@ static int print_query(const Gpu *g, const char *fields, int header, int units)
     return 0;
 }
 
+// --list: every value we read, one "key : value" per line (the --query-gpu fields, then what has no NVIDIA field name)
+static void print_list(const Gpu *g)
+{
+    int w = 0;
+    for (unsigned k = 0; k < sizeof kFields / sizeof kFields[0]; k++) { int l = (int)strlen(kFields[k].name); if (l > w) w = l; }
+    char v[PROC_PIDPATHINFO_MAXSIZE + 16], key[64];
+    for (unsigned k = 0; k < sizeof kFields / sizeof kFields[0]; k++) {
+        if (field_value(g, kFields[k].name, v, sizeof v)) continue;
+        int na = v[0] == '[';
+        printf("%-*s : %s%s\n", w, kFields[k].name, na ? "N/A" : v, na ? "" : kFields[k].unit);
+    }
+    #define KV(k, ...) (snprintf(v, sizeof v, __VA_ARGS__), printf("%-*s : %s\n", w, k, v))
+    #define KN(k, x, unit) ((x) == NA ? KV(k, "N/A") : KV(k, "%lld%s", (long long)(x), unit))
+    KV("architecture", "%s", g->arch);
+    KV("rm_version", "%s", g->rmVersion);
+    KV("board_part_number", "%s", g->partNumber[0] ? g->partNumber : "N/A");
+    KN("temperature.gpu.ioreg", g->tempIoreg, "");
+    KN("fan.count", g->nFan, "");
+    for (int i = 0; i < g->nFan; i++) { snprintf(key, sizeof key, "fan.%d.rpm", i); KN(key, g->fanRpm[i], " RPM"); }
+    KN("process.count", g->nproc, "");
+    for (int i = 0; i < g->nproc; i++) {
+        const Proc *p = &g->procs[i]; char path[PROC_PIDPATHINFO_MAXSIZE];
+        proc_label(p->pid, path, sizeof path);
+        snprintf(key, sizeof key, "process.%d.pid", i);  KV(key, "%u", p->pid);
+        snprintf(key, sizeof key, "process.%d.type", i); KV(key, "%s", p->type == 'X' ? "C+G" : p->type == 'C' ? "C" : "G");
+        snprintf(key, sizeof key, "process.%d.name", i); KV(key, "%s", path);
+        snprintf(key, sizeof key, "process.%d.used_memory", i); KN(key, p->memMiB, " MiB");
+    }
+    #undef KN
+    #undef KV
+}
+
 static void dmon_header(void)
 {
     printf("# gpu    pwr  gtemp  mtemp     sm    mem    enc    dec    jpg    ofa   mclk   pclk\n");
@@ -606,37 +813,68 @@ static void dmon_line(const Gpu *g)
     #undef F
 }
 
+static void pmon_header(void)
+{
+    printf("# gpu        pid  type    sm   mem   enc   dec   jpg   ofa    fb   command\n");
+    printf("# Idx          #     -     %%     %%     %%     %%     %%     %%   MiB   name\n");
+}
+static void pmon_line(const Gpu *g)
+{
+    if (!g->nproc) { printf("%5d          -     -     -     -     -     -     -     -     -   -\n", 0); return; }
+    for (int i = 0; i < g->nproc; i++) {
+        char path[PROC_PIDPATHINFO_MAXSIZE], name[16]; proc_label(g->procs[i].pid, path, sizeof path);
+        const char *base = strrchr(path, '/'); base = base ? base + 1 : path;
+        snprintf(name, sizeof name, "%s", base);
+        char mem[8]; if (g->procs[i].memMiB != NA) snprintf(mem, sizeof mem, "%lld", g->procs[i].memMiB); else snprintf(mem, sizeof mem, "-");
+        printf("%5d %10u  %4s     -     -     -     -     -     - %5s   %s\n", 0, g->procs[i].pid,
+               g->procs[i].type == 'X' ? "C+G" : g->procs[i].type == 'C' ? "  C" : "  G", mem, name);
+    }
+}
+
 static void usage(void)
 {
-    fprintf(stderr, "usage: nvidia-smi [-L] [-q [-d SECTIONS]] [--query-gpu=FIELDS --format=csv[,noheader][,nounits]] [dmon [-c N]]\n"
-                    "                  [-l [SEC] | -lms [MS]] [--fan-max-rpm N] [-v] [--help-query-gpu]\n"
+    fprintf(stderr, "usage: nvidia-smi [-L] [--list] [-q [-d SECTIONS]] [--query-gpu=FIELDS --format=csv[,noheader][,nounits]]\n"
+                    "                  [dmon [-d SEC] [-c N]] [pmon [-d SEC] [-c N]] [-l [SEC] | -lms [MS]] [--fan-max-rpm N] [-v]\n"
+                    "                  [--help-query-gpu]\n"
                     "  --fan-max-rpm N (or NVSMI_FAN_MAX_RPM): show fan.speed %% as an estimate of RPM / N (the page carries RPM only)\n");
 }
 
 int main(int argc, char **argv)
 {
-    int list = 0, full = 0, dmon = 0, count = 0, header = 1, units = 1; long loopMs = 0;
+    int list = 0, kv = 0, full = 0, dmon = 0, pmon = 0, count = 0, header = 1, units = 1, hasFormat = 0, dmonDelay = 1; long loopMs = 0;
     const char *sections = NULL, *fields = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-L") || !strcmp(a, "--list-gpus")) list = 1;
+        else if (!strcmp(a, "--list")) kv = 1;
         else if (!strcmp(a, "-q") || !strcmp(a, "--query")) full = 1;
-        else if ((!strcmp(a, "-d") || !strcmp(a, "--display")) && i + 1 < argc) sections = argv[++i];
+        else if ((!strcmp(a, "-d") || !strcmp(a, "--display")) && !(dmon || pmon) && i + 1 < argc) sections = argv[++i];
         else if (!strncmp(a, "--display=", 10)) sections = a + 10;
         else if (!strcmp(a, "dmon")) dmon = 1;
+        else if (!strcmp(a, "pmon")) pmon = 1;
         else if (!strcmp(a, "-c") && i + 1 < argc) count = atoi(argv[++i]);
+        else if (!strcmp(a, "-d") && (dmon || pmon) && i + 1 < argc) { int d = atoi(argv[++i]); if (d > 0) dmonDelay = d; }
         else if (!strncmp(a, "--query-gpu=", 12)) fields = a + 12;
-        else if (!strncmp(a, "--format=", 9)) { if (strstr(a, "noheader")) header = 0; if (strstr(a, "nounits")) units = 0; }
+        else if (!strncmp(a, "--format=", 9)) { hasFormat = 1; if (strstr(a, "noheader")) header = 0; if (strstr(a, "nounits")) units = 0; }
         else if (!strcmp(a, "-l") || !strcmp(a, "--loop")) { loopMs = 1000; if (i + 1 < argc && atoi(argv[i + 1]) > 0) loopMs = 1000L * atoi(argv[++i]); }
         else if (!strncmp(a, "--loop=", 7)) loopMs = 1000L * (atoi(a + 7) > 0 ? atoi(a + 7) : 1);
         else if (!strcmp(a, "-lms") || !strcmp(a, "--loop-ms")) { loopMs = 1000; if (i + 1 < argc && atoi(argv[i + 1]) > 0) loopMs = atoi(argv[++i]); }
         else if (!strcmp(a, "-v")) gVerbose = 1;
         else if (!strcmp(a, "--fan-max-rpm") && i + 1 < argc) gFanMaxRpm = atoi(argv[++i]);
         else if (!strncmp(a, "--fan-max-rpm=", 14)) gFanMaxRpm = atoi(a + 14);
-        else if (!strcmp(a, "--help-query-gpu")) { for (unsigned k = 0; k < sizeof kFields / sizeof kFields[0]; k++) printf("\"%s\"\n", kFields[k].name); return 0; }
+        else if (!strcmp(a, "--help-query-gpu")) {
+            int maxw = 0;
+            for (unsigned k = 0; k < sizeof kFields / sizeof kFields[0]; k++) { int w = (int)strlen(kFields[k].name); if (w > maxw) maxw = w; }
+            printf("List of valid properties to query for the switch \"--query-gpu\":\n\n");
+            for (unsigned k = 0; k < sizeof kFields / sizeof kFields[0]; k++) printf("  \"%-*s\" - %s\n", maxw, kFields[k].name, kFields[k].desc);
+            return 0;
+        }
+        else if (!strcmp(a, "-i")) { if (i + 1 < argc) i++; }   // GPU index selector: ignored (single GPU), swallow the argument
         else { usage(); return 2; }
     }
+    if (fields && !hasFormat) { fprintf(stderr, "\"--format=csv\" is required when \"--query-gpu\" is specified.\nRun 'nvidia-smi --help-query-gpu' for more info.\n"); return 2; }
     if (!gFanMaxRpm) { const char *e = getenv("NVSMI_FAN_MAX_RPM"); if (e && atoi(e) > 0) gFanMaxRpm = atoi(e); }
+    signal(SIGINT, sig_stop); signal(SIGTERM, sig_stop);
     nv_ioctl_card_info_t ci;
     if (rm_open(&ci)) { rm_close(); return 9; }
     static Gpu g;
@@ -644,17 +882,21 @@ int main(int argc, char **argv)
     if (list) { query(&g, &ci); printf("GPU 0: %s (UUID: %s)\n", g.name, g.uuid); }
     else if (dmon) {
         dmon_header();
-        do { query(&g, &ci); dmon_line(&g); fflush(stdout); if (count && ++n >= count) break; sleep(1); } while (1);
+        while (gRunning) { query(&g, &ci); dmon_line(&g); fflush(stdout); if (count && ++n >= count) break; if (n % 20 == 0) dmon_header(); sleep(dmonDelay); }
+    } else if (pmon) {
+        pmon_header();
+        while (gRunning) { query(&g, &ci); pmon_line(&g); fflush(stdout); if (count && ++n >= count) break; if (n % 20 == 0) pmon_header(); sleep(dmonDelay); }
     } else do {
         query(&g, &ci);
         if (fields) rc = print_query(&g, fields, header, units);
+        else if (kv) { print_list(&g); if (loopMs) printf("\n"); }
         else if (full) print_q(&g, sections);
         else { if (loopMs) printf("\033[H\033[2J"); print_table(&g); }
         fflush(stdout);
         if (rc || !loopMs) break;
-        header = 0;   // like nvidia-smi: the csv header once
+        header = 0;
         usleep((useconds_t)(loopMs * 1000));
-    } while (1);
+    } while (gRunning);
     rm_close();
     return rc;
 }
