@@ -11,8 +11,9 @@
 //   -v                                  print RM controls that failed (stderr)
 //
 // RM structs and control numbers: NVIDIA open-gpu-kernel-modules 615.78.08 (the RM of NullMoth 2.5.x).
-// Fan speed and power draw: on GSP cards the GSP firmware reads them and answers NVIDIA's fan / power-monitor controls, but
-// the open RM that NullMoth's NVRM is built from does not export those controls, so they print N/A.
+// Power draw, power limits, fan RPM and the board / memory temperatures come from the RM's user shared data page (class
+// RM_USER_SHARED_DATA, 0x00de, open header class/cl00de.h): allocated on the subdevice with a polling mask, the RM keeps it
+// refreshed and nvidia-smi maps it read-only, as NVIDIA's NVML does. The fan level in % is not on that page: N/A.
 // Build: build.sh next to this file.
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -29,9 +30,11 @@
 #include "nvstatus.h"
 #include "nv_escape.h"
 #include "nv-ioctl.h"
+#include "nv-unix-nvos-params-wrappers.h"
 #include "class/cl0000.h"
 #include "class/cl0080.h"
 #include "class/cl2080.h"
+#include "class/cl00de.h"
 #include "ctrl/ctrl0000/ctrl0000gpu.h"
 #include "ctrl/ctrl0000/ctrl0000system.h"
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
@@ -48,7 +51,7 @@ static NvHandle hClient, hDevice = 0xcaf00001, hSubdev = 0xcaf00002;
 static int gVerbose;
 
 // ---- RM client --------------------------------------------------------------------------------------------------------
-static io_connect_t open_conn(uint32_t type)
+static io_connect_t open_conn(uint32_t type, int *fdOut)
 {
     // like NVK's nvrm_xnu_open: NVAccel's bridge (0x4E56xxxx), else NVRM itself
     io_connect_t conn = 0; kern_return_t kr = KERN_FAILURE;
@@ -63,6 +66,7 @@ static io_connect_t open_conn(uint32_t type)
     int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);   // the user client keys its RM file on an fd number
     uint64_t in = (uint64_t)fd;
     IOConnectCallScalarMethod(conn, SEL_BINDFD, &in, 1, NULL, NULL);
+    if (fdOut) *fdOut = fd;
     return conn;
 }
 static int esc(io_connect_t conn, uint32_t cmd, void *data, size_t size)
@@ -86,15 +90,43 @@ static NV_STATUS rm_ctrl(NvHandle obj, NvU32 cmd, void *params, NvU32 size)
     if (p.status && gVerbose) fprintf(stderr, "control 0x%08x -> status 0x%x\n", cmd, p.status);
     return p.status;
 }
+// ---- RM user shared data (class 0x00de) -------------------------------------------------------------------------------
+static NvHandle hRusd = 0xcaf00003;
+static io_connect_t gRusdConn;
+static NV00DE_SHARED_DATA *gRusd;
+// allocate the page on the subdevice with a polling mask, map it (RM_MAP_MEMORY on the control connection names a second
+// connection by its fd, whose memory type 0 carries the mapping), then wait for the first polled sample
+static void rusd_open(void)
+{
+    NV00DE_ALLOC_PARAMETERS a = { .polledDataMask = NV00DE_RUSD_POLL_POWER | NV00DE_RUSD_POLL_THERMAL | NV00DE_RUSD_POLL_FAN };
+    NvHandle h = hRusd;
+    if (rm_alloc(hSubdev, &h, RM_USER_SHARED_DATA, &a) != NV_OK) { if (gVerbose) fprintf(stderr, "RUSD: alloc failed\n"); return; }
+    hRusd = h;
+    int fd = -1; gRusdConn = open_conn(0, &fd);
+    if (!gRusdConn) return;
+    const NvHandle parents[2] = { hSubdev, hDevice };
+    for (int i = 0; i < 2 && !gRusd; i++) {
+        nv_ioctl_nvos33_parameters_with_fd m = { .params = { .hClient = hClient, .hDevice = parents[i], .hMemory = hRusd, .offset = 0,
+                                                             .length = sizeof(NV00DE_SHARED_DATA) }, .fd = fd };
+        if (esc(gCtl, NV_ESC_RM_MAP_MEMORY, &m, sizeof m) || m.params.status) { if (gVerbose) fprintf(stderr, "RUSD: map via 0x%08x -> 0x%x\n", parents[i], m.params.status); continue; }
+        mach_vm_address_t addr = 0; mach_vm_size_t len = 0;
+        if (IOConnectMapMemory64(gRusdConn, 0, mach_task_self(), &addr, &len, kIOMapAnywhere) == KERN_SUCCESS && len >= sizeof(NV00DE_SHARED_DATA))
+            gRusd = (NV00DE_SHARED_DATA *)(uintptr_t)addr;
+        else if (gVerbose) fprintf(stderr, "RUSD: IOConnectMapMemory64 failed\n");
+    }
+    for (int i = 0; gRusd && i < 40 && !RusdIsSeqValid(gRusd->instPowerUsage.lastModifiedTimestamp); i++) usleep(50000);   // first poll
+}
+
 static void rm_close(void)
 {
+    if (gRusdConn) IOServiceClose(gRusdConn);
     if (hClient) { NVOS00_PARAMETERS p = { .hRoot = hClient, .hObjectParent = hClient, .hObjectOld = hClient }; esc(gCtl, NV_ESC_RM_FREE, &p, sizeof p); }
     if (gDev) IOServiceClose(gDev);
     if (gCtl) IOServiceClose(gCtl);
 }
 static int rm_open(nv_ioctl_card_info_t *ci)
 {
-    gCtl = open_conn(0); gDev = open_conn(1);
+    gCtl = open_conn(0, NULL); gDev = open_conn(1, NULL);
     if (!gCtl || !gDev) { fprintf(stderr, "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver. Make sure that the latest NVIDIA driver is installed and running.\n"); return -1; }
     memset(ci, 0, sizeof *ci);
     if (esc(gCtl, NV_ESC_CARD_INFO, ci, sizeof *ci) || !ci->valid) { fprintf(stderr, "No devices were found\n"); return -1; }
@@ -108,6 +140,7 @@ static int rm_open(nv_ioctl_card_info_t *ci)
     if (rm_alloc(hClient, &hDevice, NV01_DEVICE_0, &a0) != NV_OK || rm_alloc(hDevice, &hSubdev, NV20_SUBDEVICE_0, &a2) != NV_OK) {
         fprintf(stderr, "NVIDIA-SMI: device/subdevice allocation failed\n"); return -1;
     }
+    rusd_open();
     return 0;
 }
 
@@ -123,6 +156,8 @@ typedef struct {
     int clkGr, clkMem, clkVid;                                                         // MHz
     int pcieGenCur, pcieGenMax, pcieWidthCur, pcieWidthMax;
     int encSessions, encFps, encLatencyUs;
+    long long powerInst, powerAvg, powerLimitReq, powerLimitEnf;                        // mW, NA if unknown
+    int fanRpm[RUSD_FAN_COOLER_MAX_COOLERS], nFan, tempMem, tempBoard;
     Proc procs[256]; int nproc;
 } Gpu;
 
@@ -170,6 +205,7 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
     g->clkGr = g->clkMem = g->clkVid = NA;
     g->pcieGenCur = g->pcieGenMax = g->pcieWidthCur = g->pcieWidthMax = NA;
     g->encSessions = g->encFps = g->encLatencyUs = NA;
+    g->powerInst = g->powerAvg = g->powerLimitReq = g->powerLimitEnf = NA; g->tempMem = g->tempBoard = NA;
 
     g->devId = ci->pci_info.device_id; g->subsys = 0;
     snprintf(g->arch, sizeof g->arch, "%s", arch_of(g->devId));
@@ -275,6 +311,22 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
 
     g->dispActive = display_active();
 
+    // the RM's user shared data page: power, power limits, fan RPM, board / memory temperatures
+    if (gRusd) {
+        RUSD_INST_POWER_USAGE ip; RUSD_AVG_POWER_USAGE ap; RUSD_POWER_LIMITS pl; RUSD_FAN_COOLER_STATUS fc; RUSD_TEMPERATURE t;
+        if (RUSD_READ_DATA(gRusd, instPowerUsage, &ip) && ip.info.instGpuPower) g->powerInst = ip.info.instGpuPower;
+        if (RUSD_READ_DATA(gRusd, avgPowerUsage, &ap) && ap.info.averageGpuPower) g->powerAvg = ap.info.averageGpuPower;
+        if (RUSD_READ_DATA(gRusd, powerLimitGpu, &pl)) {
+            if (pl.info.requestedmW) g->powerLimitReq = pl.info.requestedmW;
+            if (pl.info.enforcedmW) g->powerLimitEnf = pl.info.enforcedmW;
+        }
+        if (RUSD_READ_DATA(gRusd, fanCoolerStatus, &fc))
+            for (unsigned i = 0; i < RUSD_FAN_COOLER_MAX_COOLERS; i++) if (fc.info.rpmCurr[i]) g->fanRpm[g->nFan++] = (int)fc.info.rpmCurr[i];
+        if (RUSD_READ_DATA(gRusd, temperatures[RUSD_TEMPERATURE_TYPE_MEMORY], &t) && t.temperature > 0) g->tempMem = NV_TYPES_NV_TEMP_TO_CELSIUS_ROUNDED(t.temperature);
+        if (RUSD_READ_DATA(gRusd, temperatures[RUSD_TEMPERATURE_TYPE_BOARD], &t) && t.temperature > 0) g->tempBoard = NV_TYPES_NV_TEMP_TO_CELSIUS_ROUNDED(t.temperature);
+        if (g->powerInst == NA && g->powerAvg != NA) g->powerInst = g->powerAvg;
+    }
+
     // processes: PIDs that own 3D / compute objects, and their video memory
     const struct { NvU32 cls; char type; } kinds[] = { { 0xC997u, 'G' }, { 0xC9C0u, 'C' }, { 0xC597u, 'G' }, { 0xC5C0u, 'C' }, { 0xC797u, 'G' }, { 0xC7C0u, 'C' } };
     for (unsigned k = 0; k < sizeof kinds / sizeof kinds[0]; k++) {
@@ -336,7 +388,10 @@ static void print_table(const Gpu *g)
     char temp[16], perf[16];
     if (g->temp != NA) snprintf(temp, sizeof temp, "%dC", g->temp); else snprintf(temp, sizeof temp, "N/A");
     if (g->pstate != NA) snprintf(perf, sizeof perf, "P%d", g->pstate); else snprintf(perf, sizeof perf, "N/A");
-    snprintf(a, sizeof a, "%4s  %5s    %-4s", "N/A", temp, perf); cell(l, 41, a, "N/A /  N/A");
+    char pwr[32];
+    snprintf(pwr, sizeof pwr, "%s / %s", g->powerInst != NA ? (snprintf(b, sizeof b, "%lldW", (g->powerInst + 500) / 1000), b) : "N/A",
+             g->powerLimitEnf != NA ? (snprintf(c, sizeof c, "%lldW", (g->powerLimitEnf + 500) / 1000), c) : "N/A");
+    snprintf(a, sizeof a, "%4s  %5s    %-4s", "N/A", temp, perf); cell(l, 41, a, pwr);
     if (g->memTotal != NA) snprintf(b, sizeof b, "%lldMiB / %6lldMiB", g->memUsed, g->memTotal);   // like NVIDIA since R535: without "Reserved" else snprintf(b, sizeof b, "N/A / N/A");
     cell(m, 24, "", b);
     if (g->utilGpu != NA) snprintf(c, sizeof c, "%8d%%", g->utilGpu); else snprintf(c, sizeof c, "%9s", "N/A");
@@ -394,7 +449,8 @@ static void print_q(const Gpu *g, const char *sections)
         printf("                Max                       : %s\n", g->pcieWidthMax != NA ? (snprintf(x, sizeof x, "%dx", g->pcieWidthMax), x) : "N/A");
         printf("                Current                   : %s\n", g->pcieWidthCur != NA ? (snprintf(y, sizeof y, "%dx", g->pcieWidthCur), y) : "N/A");
     }
-    printf("    Fan Speed                             : N/A\n");
+    printf("    Fan Speed                             : N/A\n");   // the level in % is not on the RM's shared data page
+    for (int i = 0; i < g->nFan; i++) { char lab[48]; snprintf(lab, sizeof lab, "Fan %d Speed (tachometer)", i); printf("    %-38s: %d RPM\n", lab, g->fanRpm[i]); }
     if (want(sections, "PERFORMANCE")) printf("    Performance State                     : %s\n", g->pstate != NA ? (snprintf(x, sizeof x, "P%d", g->pstate), x) : "N/A");
     if (want(sections, "MEMORY")) {
         printf("    FB Memory Usage\n");
@@ -428,13 +484,17 @@ static void print_q(const Gpu *g, const char *sections)
         printf("        GPU Current Temp                  : %s\n", num(x, sizeof x, g->temp, " C"));
         printf("        GPU Temp (IORegistry)             : %s\n", num(x, sizeof x, g->tempIoreg, " C"));
         printf("        GPU T.Limit Temp                  : N/A\n");
-        printf("        Memory Current Temp               : N/A\n");
+        printf("        Memory Current Temp               : %s\n", num(x, sizeof x, g->tempMem, " C"));
+        printf("        Board Temp                        : %s\n", num(x, sizeof x, g->tempBoard, " C"));
     }
     if (want(sections, "POWER")) {
+        #define W(v) ((v) == NA ? "N/A" : (snprintf(x, sizeof x, "%.2f W", (v) / 1000.0), x))
         printf("    GPU Power Readings\n");
-        printf("        Power Draw                        : N/A\n");
-        printf("        Current Power Limit               : N/A\n");
-        printf("        (fan and power are read by the GSP firmware; the open RM in this driver does not export them)\n");
+        printf("        Average Power Draw                : %s\n", W(g->powerAvg));
+        printf("        Instantaneous Power Draw          : %s\n", W(g->powerInst));
+        printf("        Current Power Limit               : %s\n", W(g->powerLimitEnf));
+        printf("        Requested Power Limit             : %s\n", W(g->powerLimitReq));
+        #undef W
     }
     if (want(sections, "CLOCK")) {
         printf("    Clocks\n");
@@ -469,7 +529,8 @@ static const Field kFields[] = {
     { "clocks.gr", " MHz" }, { "clocks.sm", " MHz" }, { "clocks.mem", " MHz" }, { "clocks.video", " MHz" },
     { "pcie.link.gen.current", "" }, { "pcie.link.gen.max", "" }, { "pcie.link.width.current", "" }, { "pcie.link.width.max", "" },
     { "encoder.stats.sessionCount", "" }, { "encoder.stats.averageFps", "" }, { "encoder.stats.averageLatency", "" },
-    { "fan.speed", " %" }, { "power.draw", " W" }, { "power.limit", " W" },
+    { "fan.speed", " %" }, { "fan.rpm", " RPM" }, { "power.draw", " W" }, { "power.draw.average", " W" }, { "power.draw.instant", " W" },
+    { "power.limit", " W" }, { "enforced.power.limit", " W" }, { "temperature.memory", "" },
 };
 static int field_value(const Gpu *g, const char *f, char *out, size_t n)
 {
@@ -491,7 +552,14 @@ static int field_value(const Gpu *g, const char *f, char *out, size_t n)
     else if (!strcmp(f, "pcie.link.width.current")) v = g->pcieWidthCur; else if (!strcmp(f, "pcie.link.width.max")) v = g->pcieWidthMax;
     else if (!strcmp(f, "encoder.stats.sessionCount")) v = g->encSessions; else if (!strcmp(f, "encoder.stats.averageFps")) v = g->encFps;
     else if (!strcmp(f, "encoder.stats.averageLatency")) v = g->encLatencyUs;
-    else if (!strcmp(f, "fan.speed") || !strcmp(f, "power.draw") || !strcmp(f, "power.limit")) s = "[N/A]";
+    else if (!strcmp(f, "fan.speed")) s = "[N/A]";
+    else if (!strcmp(f, "fan.rpm")) v = g->nFan ? g->fanRpm[0] : NA;
+    else if (!strcmp(f, "temperature.memory")) v = g->tempMem;
+    else if (!strcmp(f, "power.draw") || !strcmp(f, "power.draw.instant") || !strcmp(f, "power.draw.average") || !strcmp(f, "power.limit") || !strcmp(f, "enforced.power.limit")) {
+        const long long mw = !strcmp(f, "power.draw.average") ? g->powerAvg : !strncmp(f, "power.draw", 10) ? g->powerInst
+                           : !strcmp(f, "power.limit") && g->powerLimitReq != NA ? g->powerLimitReq : g->powerLimitEnf;
+        if (mw == NA) s = "[N/A]"; else { snprintf(out, n, "%.2f", mw / 1000.0); return 0; }
+    }
     else return -1;
     if (s) snprintf(out, n, "%s", s); else if (v == NA) snprintf(out, n, "[N/A]"); else snprintf(out, n, "%lld", v);
     return 0;
@@ -523,9 +591,10 @@ static void dmon_header(void)
 }
 static void dmon_line(const Gpu *g)
 {
-    char t[8], s[8], m[8], e[8], d[8], j[8], o[8], mc[8], pc[8];
+    char p[8], t[8], mt[8], s[8], m[8], e[8], d[8], j[8], o[8], mc[8], pc[8];
     #define F(buf, v) (v == NA ? snprintf(buf, sizeof buf, "-") : snprintf(buf, sizeof buf, "%d", v), buf)
-    printf("%5d %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s\n", 0, "-", F(t, g->temp), "-", F(s, g->utilGpu), F(m, g->utilMem), F(e, g->utilEnc),
+    const int pw = g->powerInst == NA ? NA : (int)((g->powerInst + 500) / 1000);
+    printf("%5d %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s %6s\n", 0, F(p, pw), F(t, g->temp), F(mt, g->tempMem), F(s, g->utilGpu), F(m, g->utilMem), F(e, g->utilEnc),
            F(d, g->utilDec), F(j, g->utilJpg), F(o, g->utilOfa), F(mc, g->clkMem), F(pc, g->clkGr));
     #undef F
 }
