@@ -49,6 +49,7 @@ enum { SEL_ESC = 1, SEL_BINDFD = 3 };
 static io_connect_t gCtl, gDev;
 static NvHandle hClient, hDevice = 0xcaf00001, hSubdev = 0xcaf00002;
 static int gVerbose;
+static int gFanMaxRpm;   // --fan-max-rpm N or NVSMI_FAN_MAX_RPM: enables fan.speed % = round(rpm / max * 100), clamped 0..100
 
 // ---- RM client --------------------------------------------------------------------------------------------------------
 static io_connect_t open_conn(uint32_t type, int *fdOut)
@@ -157,7 +158,7 @@ typedef struct {
     int pcieGenCur, pcieGenMax, pcieWidthCur, pcieWidthMax;
     int encSessions, encFps, encLatencyUs;
     long long powerInst, powerAvg, powerLimitReq, powerLimitEnf;                        // mW, NA if unknown
-    int fanRpm[RUSD_FAN_COOLER_MAX_COOLERS], nFan, tempMem, tempBoard;
+    int fanRpm[RUSD_FAN_COOLER_MAX_COOLERS], nFan, tempMem, tempBoard, fanPct;   // fanPct: estimate from fan 0 RPM / gFanMaxRpm
     Proc procs[256]; int nproc;
 } Gpu;
 
@@ -205,7 +206,7 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
     g->clkGr = g->clkMem = g->clkVid = NA;
     g->pcieGenCur = g->pcieGenMax = g->pcieWidthCur = g->pcieWidthMax = NA;
     g->encSessions = g->encFps = g->encLatencyUs = NA;
-    g->powerInst = g->powerAvg = g->powerLimitReq = g->powerLimitEnf = NA; g->tempMem = g->tempBoard = NA;
+    g->powerInst = g->powerAvg = g->powerLimitReq = g->powerLimitEnf = NA; g->tempMem = g->tempBoard = g->fanPct = NA;
 
     g->devId = ci->pci_info.device_id; g->subsys = 0;
     snprintf(g->arch, sizeof g->arch, "%s", arch_of(g->devId));
@@ -322,6 +323,9 @@ static void query(Gpu *g, const nv_ioctl_card_info_t *ci)
         }
         if (RUSD_READ_DATA(gRusd, fanCoolerStatus, &fc))
             for (unsigned i = 0; i < RUSD_FAN_COOLER_MAX_COOLERS; i++) if (fc.info.rpmCurr[i]) g->fanRpm[g->nFan++] = (int)fc.info.rpmCurr[i];
+        // fan speed %: the shared data page carries RPM only, so estimate it against a configured maximum RPM (--fan-max-rpm /
+        // NVSMI_FAN_MAX_RPM). NVIDIA's own % is the requested duty cycle, not RPM/max, so this is an approximation.
+        if (gFanMaxRpm > 0 && g->nFan) { int p = (g->fanRpm[0] * 100 + gFanMaxRpm / 2) / gFanMaxRpm; g->fanPct = p < 0 ? 0 : p > 100 ? 100 : p; }
         if (RUSD_READ_DATA(gRusd, temperatures[RUSD_TEMPERATURE_TYPE_MEMORY], &t) && t.temperature > 0) g->tempMem = NV_TYPES_NV_TEMP_TO_CELSIUS_ROUNDED(t.temperature);
         if (RUSD_READ_DATA(gRusd, temperatures[RUSD_TEMPERATURE_TYPE_BOARD], &t) && t.temperature > 0) g->tempBoard = NV_TYPES_NV_TEMP_TO_CELSIUS_ROUNDED(t.temperature);
         if (g->powerInst == NA && g->powerAvg != NA) g->powerInst = g->powerAvg;
@@ -391,7 +395,8 @@ static void print_table(const Gpu *g)
     char pwr[32];
     snprintf(pwr, sizeof pwr, "%s / %s", g->powerInst != NA ? (snprintf(b, sizeof b, "%lldW", (g->powerInst + 500) / 1000), b) : "N/A",
              g->powerLimitEnf != NA ? (snprintf(c, sizeof c, "%lldW", (g->powerLimitEnf + 500) / 1000), c) : "N/A");
-    snprintf(a, sizeof a, "%4s  %5s    %-4s", "N/A", temp, perf); cell(l, 41, a, pwr);
+    char fan[8]; if (g->fanPct != NA) snprintf(fan, sizeof fan, "%d%%", g->fanPct); else snprintf(fan, sizeof fan, "N/A");
+    snprintf(a, sizeof a, "%4s  %5s    %-4s", fan, temp, perf); cell(l, 41, a, pwr);
     if (g->memTotal != NA) snprintf(b, sizeof b, "%lldMiB / %6lldMiB", g->memUsed, g->memTotal);   // like NVIDIA since R535: without "Reserved" else snprintf(b, sizeof b, "N/A / N/A");
     cell(m, 24, "", b);
     if (g->utilGpu != NA) snprintf(c, sizeof c, "%8d%%", g->utilGpu); else snprintf(c, sizeof c, "%9s", "N/A");
@@ -449,7 +454,9 @@ static void print_q(const Gpu *g, const char *sections)
         printf("                Max                       : %s\n", g->pcieWidthMax != NA ? (snprintf(x, sizeof x, "%dx", g->pcieWidthMax), x) : "N/A");
         printf("                Current                   : %s\n", g->pcieWidthCur != NA ? (snprintf(y, sizeof y, "%dx", g->pcieWidthCur), y) : "N/A");
     }
-    printf("    Fan Speed                             : N/A\n");   // the level in % is not on the RM's shared data page
+    // the level in % is not on the RM's shared data page; shown only as an RPM/max estimate when a max is configured
+    if (g->fanPct != NA) printf("    Fan Speed                             : %d %% (estimated, %d/%d RPM)\n", g->fanPct, g->nFan ? g->fanRpm[0] : 0, gFanMaxRpm);
+    else printf("    Fan Speed                             : N/A\n");
     for (int i = 0; i < g->nFan; i++) { char lab[48]; snprintf(lab, sizeof lab, "Fan %d Speed (tachometer)", i); printf("    %-38s: %d RPM\n", lab, g->fanRpm[i]); }
     if (want(sections, "PERFORMANCE")) printf("    Performance State                     : %s\n", g->pstate != NA ? (snprintf(x, sizeof x, "P%d", g->pstate), x) : "N/A");
     if (want(sections, "MEMORY")) {
@@ -552,7 +559,7 @@ static int field_value(const Gpu *g, const char *f, char *out, size_t n)
     else if (!strcmp(f, "pcie.link.width.current")) v = g->pcieWidthCur; else if (!strcmp(f, "pcie.link.width.max")) v = g->pcieWidthMax;
     else if (!strcmp(f, "encoder.stats.sessionCount")) v = g->encSessions; else if (!strcmp(f, "encoder.stats.averageFps")) v = g->encFps;
     else if (!strcmp(f, "encoder.stats.averageLatency")) v = g->encLatencyUs;
-    else if (!strcmp(f, "fan.speed")) s = "[N/A]";
+    else if (!strcmp(f, "fan.speed")) v = g->fanPct;
     else if (!strcmp(f, "fan.rpm")) v = g->nFan ? g->fanRpm[0] : NA;
     else if (!strcmp(f, "temperature.memory")) v = g->tempMem;
     else if (!strcmp(f, "power.draw") || !strcmp(f, "power.draw.instant") || !strcmp(f, "power.draw.average") || !strcmp(f, "power.limit") || !strcmp(f, "enforced.power.limit")) {
@@ -602,7 +609,8 @@ static void dmon_line(const Gpu *g)
 static void usage(void)
 {
     fprintf(stderr, "usage: nvidia-smi [-L] [-q [-d SECTIONS]] [--query-gpu=FIELDS --format=csv[,noheader][,nounits]] [dmon [-c N]]\n"
-                    "                  [-l [SEC] | -lms [MS]] [-v] [--help-query-gpu]\n");
+                    "                  [-l [SEC] | -lms [MS]] [--fan-max-rpm N] [-v] [--help-query-gpu]\n"
+                    "  --fan-max-rpm N (or NVSMI_FAN_MAX_RPM): show fan.speed %% as an estimate of RPM / N (the page carries RPM only)\n");
 }
 
 int main(int argc, char **argv)
@@ -623,9 +631,12 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "--loop=", 7)) loopMs = 1000L * (atoi(a + 7) > 0 ? atoi(a + 7) : 1);
         else if (!strcmp(a, "-lms") || !strcmp(a, "--loop-ms")) { loopMs = 1000; if (i + 1 < argc && atoi(argv[i + 1]) > 0) loopMs = atoi(argv[++i]); }
         else if (!strcmp(a, "-v")) gVerbose = 1;
+        else if (!strcmp(a, "--fan-max-rpm") && i + 1 < argc) gFanMaxRpm = atoi(argv[++i]);
+        else if (!strncmp(a, "--fan-max-rpm=", 14)) gFanMaxRpm = atoi(a + 14);
         else if (!strcmp(a, "--help-query-gpu")) { for (unsigned k = 0; k < sizeof kFields / sizeof kFields[0]; k++) printf("\"%s\"\n", kFields[k].name); return 0; }
         else { usage(); return 2; }
     }
+    if (!gFanMaxRpm) { const char *e = getenv("NVSMI_FAN_MAX_RPM"); if (e && atoi(e) > 0) gFanMaxRpm = atoi(e); }
     nv_ioctl_card_info_t ci;
     if (rm_open(&ci)) { rm_close(); return 9; }
     static Gpu g;
